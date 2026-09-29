@@ -42,3 +42,5 @@ tests/tmp/
 /mcps/tasks/tools
 /bin/resvg.exe
 /scratch.txt
+.codebuddy/
+sidecar_log/

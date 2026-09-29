@@ -947,6 +947,20 @@ const annotations: Field[] = [
     "author recorded on newly created annotations. If not set, the Windows user name is used; " +
       "set it to (none) to leave the author out entirely",
   ).ver("3.4"),
+  field(
+    "SeparateSave",
+    Bool,
+    false,
+    "if true, annotations are saved as a separate JSON file next to the PDF (or under CentralFolder) instead of " +
+      "inside the PDF; the PDF is never modified",
+  ),
+  field(
+    "CentralFolder",
+    Str,
+    "",
+    "central folder for JSON annotation files, used when no such file exists next to the PDF: the file is looked up " +
+      "in <CentralFolder>/<pdf parent folder name>/<pdf name>.json",
+  ),
 ];
 
 const favorite: Field[] = [

@@ -760,6 +760,13 @@ struct Annotations {
     // Windows user name is used; set it to (none) to leave the author out
     // entirely
     Str defaultAuthor;
+    // SIDECAR: persist annotations as a separate JSON file next to the PDF
+    // (or under CentralFolder) instead of inside the PDF. The PDF itself is
+    // never modified; see Sidecar.h
+    bool separateSave;
+    // SIDECAR: central folder for JSON sidecar files, used when no sibling
+    // file exists: <CentralFolder>/<pdf parent folder name>/<pdf name>.json
+    Str centralFolder;
 };
 
 // reading bar (View menu): a horizontal band on the page to keep your
@@ -1592,15 +1599,17 @@ static const FieldInfo gAnnotationsFields[] = {
     {offsetof(Annotations, fileAttachmentColor), SettingType::Color, (intptr_t)""},
     {offsetof(Annotations, textIconType), SettingType::String, (intptr_t)""},
     {offsetof(Annotations, defaultAuthor), SettingType::String, (intptr_t)""},
+    {offsetof(Annotations, separateSave), SettingType::Bool, false},
+    {offsetof(Annotations, centralFolder), SettingType::String, (intptr_t)""},
 };
 static const StructInfo gAnnotationsInfo = {
     sizeof(Annotations),
-    25,
+    27,
     gAnnotationsFields,
     "HighlightColor\0UnderlineColor\0SquigglyColor\0StrikeOutColor\0FreeTextColor\0FreeTextBackgroundColor\0FreeTextOpa"
     "city\0FreeTextSize\0FreeTextBorderWidth\0FreeTextAlignment\0PresetColors\0TextIconColor\0LineColor\0PolyLineColor"
     "\0SquareColor\0CircleColor\0PolygonColor\0InkColor\0InkColors\0InkBorderWidth\0StampColor\0CaretColor\0FileAttachm"
-    "entColor\0TextIconType\0DefaultAuthor",
+    "entColor\0TextIconType\0DefaultAuthor\0SeparateSave\0CentralFolder",
     "color of newly created highlight annotations. Use an #aarrggbb value to set default opacity (00 = transparent, FF "
     "= opaque); #rrggbb is fully opaque\0color of newly created underline annotations. #aarrggbb sets default opacity "
     "the same way as HighlightColor\0color of newly created squiggly underline annotations. #aarrggbb sets default "
@@ -1625,7 +1634,10 @@ static const StructInfo gAnnotationsInfo = {
     "set, the PDF engine's default (red) is used\0color of newly created file attachment annotations. If not set, the "
     "PDF engine's default (red) is used\0icon shown for text (sticky note) annotations: comment, help, insert, key, "
     "new paragraph, note or paragraph. If not set, note is used\0author recorded on newly created annotations. If not "
-    "set, the Windows user name is used; set it to (none) to leave the author out entirely",
+    "set, the Windows user name is used; set it to (none) to leave the author out entirely\0if true, annotations are "
+    "saved as a separate JSON file next to the PDF (or under CentralFolder) instead of inside the PDF; the PDF is "
+    "never modified\0central folder for JSON annotation files, used when no such file exists next to the PDF: the "
+    "file is looked up in <CentralFolder>/<pdf parent folder name>/<pdf name>.json",
     false};
 
 static const FieldInfo gExternalViewerFields[] = {

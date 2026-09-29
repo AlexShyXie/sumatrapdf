@@ -29,6 +29,7 @@ extern "C" {
 #include "EbookDoc.h"
 #include "Settings.h"
 #include "EngineMupdf.h"
+#include "Sidecar.h"
 
 // A5
 static float layoutA5DxPt = 420.F;
@@ -10092,6 +10093,22 @@ static NO_INLINE void ValidateAnnotationsInSync(EngineMupdf* /*e*/, FzPageInfo* 
     // TODO: write me
 }
 
+// SIDECAR: annotation-changed hook (see Sidecar.h). Implemented here because
+// EngineMupdf.cpp is compiled into standalone targets (PdfFilter, PdfPreview)
+// that do not link Sidecar.cpp; those never install a hook, so the call is a
+// no-op for them and EngineMupdf.obj has no hard Sidecar.cpp dependency.
+static void (*gSidecarAnnotsChangedHook)(EngineBase*) = nullptr;
+
+void SidecarSetAnnotsChangedHook(void (*fn)(EngineBase*)) {
+    gSidecarAnnotsChangedHook = fn;
+}
+
+void SidecarNotifyAnnotsChanged(EngineBase* engine) {
+    if (gSidecarAnnotsChangedHook) {
+        gSidecarAnnotsChangedHook(engine);
+    }
+}
+
 // in a function so that we can set a breakpoint or add logging
 // to easily trace all places that modify annotations
 void MarkNotificationAsModified(EngineMupdf* e, Annotation* annot) {
@@ -10103,6 +10120,8 @@ NO_INLINE void MarkNotificationAsModified(EngineMupdf* e, Annotation* annot, Ann
     if (!e->pdfdoc) {
         return;
     }
+    // SIDECAR: annotations changed, (re)arm the debounced sidecar auto-save
+    SidecarNotifyAnnotsChanged((EngineBase*)e);
     int pageNo = annot->pageNo;
     ReportIf(pageNo < 1 || pageNo > e->pageCount);
 

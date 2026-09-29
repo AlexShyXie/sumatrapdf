@@ -44,6 +44,7 @@
 #include "EngineAll.h"
 #include "PdfDarkMode.h"
 #include "Annotation.h"
+#include "Sidecar.h"
 #include "FormFields.h"
 #include "PdfTools.h"
 #include "ChmModel.h"
@@ -2205,6 +2206,9 @@ DocController* CreateControllerForEngineOrFile(EngineBase* engine, Str path, Pas
         SafeEngineRelease(&engine);
         return nullptr;
     }
+    // SIDECAR: import the JSON sidecar into the freshly created PDF engine,
+    // before it is displayed (sibling first, then central folder)
+    SidecarMaybeImport(engine);
     DocController* ctrl = new DisplayModel(engine, win->cbHandler);
     ReportIf(!ctrl || !ctrl->AsFixed() || ctrl->AsChm());
     VerifyController(ctrl, path);
@@ -5833,6 +5837,11 @@ bool MaybeSaveAnnotations(WindowTab* tab) {
     bool shouldConfirm = EngineHasUnsavedAnnotations(engine);
     if (!shouldConfirm) {
         return true;
+    }
+    // SIDECAR: separateSave mode writes the JSON sidecar instead of the PDF;
+    // on write failure, don't close (that would discard the annotations)
+    if (SidecarWantsRedirect(engine)) {
+        return SidecarSaveTab(tab) == SidecarResult::Saved;
     }
     tab->askedToSaveAnnotations = true;
     MainWindow* win = tab->win;
@@ -12505,6 +12514,10 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             break;
 
         case CmdSaveAnnotations: {
+            // SIDECAR: separateSave mode redirects to writing the JSON sidecar
+            if (SidecarSaveTab(tab) != SidecarResult::NotHandled) {
+                break;
+            }
             SaveAnnotationsToExistingFile(tab);
             break;
         }

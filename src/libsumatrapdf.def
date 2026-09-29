@@ -2087,3 +2087,28 @@ EXPORTS
 
 	deskey
 	des
+; mupdf API used by Sidecar.cpp (annotation JSON sidecar)
+
+	fz_new_pool
+	fz_drop_pool
+	fz_parse_json
+	fz_json_is_boolean
+	fz_json_is_number
+	fz_json_is_string
+	fz_json_is_array
+	fz_json_is_object
+	fz_json_to_boolean
+	fz_json_to_number
+	fz_json_to_string
+	fz_json_array_length
+	fz_json_array_get
+	fz_json_object_get
+	pdf_lookup_metadata
+	pdf_annot_has_subject
+	pdf_annot_is_open
+	pdf_set_annot_is_open
+	pdf_annot_name
+	pdf_set_annot_name
+	pdf_annot_subject
+	pdf_set_annot_subject
+	pdf_set_annot_creation_date
