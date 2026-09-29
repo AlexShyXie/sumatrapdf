@@ -12180,6 +12180,17 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             break;
 
         case CmdSaveAs:
+            // SIDECAR: in separateSave mode Ctrl+S saves the JSON sidecar
+            // when there are unsaved annotation changes, instead of the
+            // "save a copy" dialog (the PDF itself is never modified, so
+            // there is nothing else to save)
+            if (tab) {
+                EngineBase* eng = tab->AsFixed() ? tab->AsFixed()->GetEngine() : nullptr;
+                if (eng && SidecarWantsRedirect(eng) && EngineHasUnsavedAnnotations(eng)) {
+                    SidecarSaveTab(tab);
+                    break;
+                }
+            }
             SaveCurrentFileAs(win);
             break;
 

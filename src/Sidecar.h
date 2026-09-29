@@ -42,7 +42,9 @@
 //   lineStart/lineEnd  line ending style names (Square, Circle, ...)
 //   icon         Text note icon name
 //   isOpen       Text note popup state
-//   fontSize / textAlign  FreeText default appearance
+//   fontSize / textColor / textAlign  FreeText default appearance (/DA)
+//   fontFamily / textStyle   FreeText rich text (/DS CSS): family name and
+//                style bits 1=bold 2=italic 4=underline (see kFreeText*)
 //   author / subject / contents / name(/NM) / text(excerpt under quads)
 //   creationDate / modDate   ISO-8601 UTC ("2026-09-28T12:00:00Z")
 //   flags        PDF annotation flags bits (print|nozoom|...)

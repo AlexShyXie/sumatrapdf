@@ -1704,6 +1704,12 @@ PdfColor DefaultAppearanceTextColor(Annotation* annot) {
     fz_catch(ctx) {
         fz_report_error(ctx);
     }
+    // a /DA without a color (n == 0) is "not set", not black: returning
+    // black here would give every color-less FreeText a spurious black text
+    // color in the sidecar round-trip
+    if (n == 0) {
+        return (PdfColor)kColorUnset;
+    }
     PdfColor res = PdfColorFromFloat(ctx, n, textColor);
     return res;
 }

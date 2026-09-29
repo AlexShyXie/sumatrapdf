@@ -216,8 +216,11 @@ static SidecarTarget ResolveCentralTarget(Str pdfPath) {
     return res;
 }
 
-// order of preference is the v5 load/save order: existing sibling wins,
-// then existing central, otherwise (when creating is allowed) sibling
+// order of preference: existing sibling wins, then existing central
+// (both load and save stay consistent with what is already on disk).
+// When CREATING a new sidecar, a configured CentralFolder is where it
+// goes - the book folders stay clean and all notes live in one place
+// (v5 semantics); without one the sibling file is the only option.
 static SidecarTarget ResolveSidecarTarget(Str pdfPath, bool allowCreate) {
     SidecarTarget sib = ResolveSiblingTarget(pdfPath);
     SidecarTarget cen = ResolveCentralTarget(pdfPath);
@@ -227,14 +230,38 @@ static SidecarTarget ResolveSidecarTarget(Str pdfPath, bool allowCreate) {
     if (cen.exists) {
         return cen;
     }
-    if (allowCreate && len(sib.path) > 0) {
-        return sib;
+    if (allowCreate) {
+        if (len(cen.path) > 0) {
+            return cen;
+        }
+        if (len(sib.path) > 0) {
+            return sib;
+        }
     }
     return SidecarTarget{};
 }
 
 // ---------------------------------------------------------------------------
 // type mapping
+
+// annotations whose /Rect is directly settable (mupdf's rect_subtypes
+// whitelist intersection with the types we support). Everything else -
+// text markups (QuadPoints), Line (endpoints), Polygon/PolyLine
+// (Vertices), Ink (InkList) - has a derived /Rect and rejects
+// pdf_set_annot_rect with "argument error: ... have no Rect property".
+static bool SidecarAnnotOwnsRect(AnnotationType tp) {
+    switch (tp) {
+        case AnnotationType::Text:
+        case AnnotationType::FreeText:
+        case AnnotationType::Square:
+        case AnnotationType::Circle:
+        case AnnotationType::Redact:
+        case AnnotationType::Caret:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static const char* kLineEndingNames[] = {"None",        "Square", "Circle",     "Diamond",      "OpenArrow",
                                          "ClosedArrow", "Butt",   "ROpenArrow", "RClosedArrow", "Slash"};
@@ -263,6 +290,8 @@ struct SidecarAnnot {
     float textColor[3] = {0, 0, 0};
     bool hasTextCol = false;
     int quadding = -1; // 0 left, 1 center, 2 right
+    Str fontFamily;    // CSS font family from /DS (base-14 fallback when absent)
+    int fontStyle = 0; // kFreeTextBold | kFreeTextItalic | kFreeTextUnderline
     int borderWidth = -1;
     // line
     bool hasLine = false;
@@ -298,6 +327,7 @@ static void FreeSidecarAnnotStrings(SidecarAnnot& sa) {
     str::Free(sa.name);
     str::Free(sa.icon);
     str::Free(sa.text);
+    str::Free(sa.fontFamily);
     sa.contents = {};
     sa.author = {};
     sa.subject = {};
@@ -642,6 +672,42 @@ static Str ExtractTextUnderQuads(StextCache& cache, int pageNo, const Vec<fz_qua
     return res.TakeStr();
 }
 
+// GetColor()/InteriorColor() cannot tell "key absent", "empty array" and
+// "black" apart: mupdf reports n == 0 with a zeroed color array both for a
+// missing /C and for an EMPTY /C [] - and "none"/transparent backgrounds
+// are stored exactly as /C [] (SetColor with c == 0 writes an empty array).
+// PdfColorFromFloat() then turns that into opaque black, so the round-trip
+// would give every color-less annotation a black fill. Ask for the number
+// of components instead: only n > 0 is a real color.
+static int AnnotColorComponents(Annotation* a, bool interior) {
+    if (!a || !AnnotationIsLive(a)) {
+        return 0;
+    }
+    EngineMupdf* e = a->engine;
+    pdf_annot* pa = a->pdfannot;
+    if (!e || !pa) {
+        return 0;
+    }
+    fz_context* ctx = e->Ctx();
+    AutoUnlockRecursiveMutex cs(&e->docLock);
+    int n = 0;
+    float color[4]{};
+    fz_try(ctx) {
+        // pdf_annot_interior_color() rejects types without /IC support
+        // (whitelist); that means "no interior color" for us
+        if (interior) {
+            pdf_annot_interior_color(ctx, pa, &n, color);
+        } else {
+            pdf_annot_color(ctx, pa, &n, color);
+        }
+    }
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+        n = 0;
+    }
+    return n;
+}
+
 static void CollectSidecarAnnot(Annotation* a, SidecarAnnot& sa, StextCache& cache) {
     sa.type = a->type;
     sa.pageNo = PageNo(a);
@@ -657,15 +723,23 @@ static void CollectSidecarAnnot(Annotation* a, SidecarAnnot& sa, StextCache& cac
     sa.icon = len(t) > 0 ? str::Dup(t) : Str{};
     sa.modDate = ModificationDate(a);
 
-    PdfColor c = GetColor(a);
-    if (c != (PdfColor)kColorUnset) {
-        PdfColorToF(c, sa.color);
-        sa.hasColor = true;
+    // only write color when the annotation has a REAL one (n > 0): an
+    // absent /C or the empty /C [] of a "none"/transparent background must
+    // not become opaque black in the round-trip
+    if (AnnotColorComponents(a, false) > 0) {
+        PdfColor c = GetColor(a);
+        if (c != (PdfColor)kColorUnset) {
+            PdfColorToF(c, sa.color);
+            sa.hasColor = true;
+        }
     }
-    PdfColor ic = InteriorColor(a);
-    if (ic != (PdfColor)kColorUnset) {
-        PdfColorToF(ic, sa.interiorCol);
-        sa.hasInterior = true;
+    // interiorColor: same empty-array trap as color
+    if (AnnotColorComponents(a, true) > 0) {
+        PdfColor ic = InteriorColor(a);
+        if (ic != (PdfColor)kColorUnset) {
+            PdfColorToF(ic, sa.interiorCol);
+            sa.hasInterior = true;
+        }
     }
     int op = Opacity(a);
     sa.opacity = (op >= 0 && op < 100) ? op / 100.0f : 1.0f;
@@ -687,6 +761,18 @@ static void CollectSidecarAnnot(Annotation* a, SidecarAnnot& sa, StextCache& cac
         int ts = DefaultAppearanceTextSize(a);
         sa.textSize = (ts > 0) ? ts : -1;
         sa.quadding = Quadding(a);
+        // /DA text color; n == 0 (absent) must not become black
+        PdfColor tc = DefaultAppearanceTextColor(a);
+        if (tc != (PdfColor)kColorUnset) {
+            PdfColorToF(tc, sa.textColor);
+            sa.hasTextCol = true;
+        }
+        // font family + bold/italic/underline come from /DS (or the base-14
+        // fallback of /DA); the sidebar's Text Font / B / I / U chips read
+        // exactly these
+        Str fam = FreeTextFontFamily(a);
+        sa.fontFamily = len(fam) > 0 ? str::Dup(fam) : Str{};
+        sa.fontStyle = FreeTextFontStyle(a);
     }
 
     // quads / vertices / ink via wrappers (Redact holds quads too: a
@@ -924,6 +1010,13 @@ static void SerializeAnnotJson(str::Builder& b, const SidecarAnnot& sa) {
         if (sa.quadding >= 0) {
             b.Append(fmt(",\n      \"textAlign\": %d", sa.quadding));
         }
+        if (len(sa.fontFamily) > 0) {
+            b.Append(StrL(",\n      \"fontFamily\": "));
+            AppendEscapedJson(b, sa.fontFamily);
+        }
+        if (sa.fontStyle != 0) {
+            b.Append(fmt(",\n      \"textStyle\": %d", sa.fontStyle));
+        }
     }
     if (sa.flags >= 0) {
         b.Append(fmt(",\n      \"flags\": %d", sa.flags));
@@ -991,7 +1084,9 @@ static Str DocTitle(EngineMupdf* e) {
 
 static constexpr int kSidecarVersion = 1;
 
-static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str pdfPath) {
+static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str pdfPath,
+                            int& nSkippedUnsupported) {
+    nSkippedUnsupported = 0;
     Vec<SidecarAnnot> entries;
     StextCache cache;
     cache.e = e;
@@ -1001,6 +1096,10 @@ static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str 
             continue;
         }
         if (!SidecarTypeSupported(a->type)) {
+            // stamp (image payload) and file attachment (embedded file
+            // payload) cannot be represented in the JSON schema; count them
+            // so the user learns why they don't come back after a reopen
+            nSkippedUnsupported++;
             continue;
         }
         SidecarAnnot sa;
@@ -1252,6 +1351,11 @@ static bool JsonToSidecarAnnot(fz_context* ctx, fz_json* o, SidecarAnnot& sa) {
     if (op >= 0 && op <= 1.0) {
         sa.opacity = (float)op;
     }
+    const char* ff = JsonStr(ctx, o, "fontFamily");
+    if (ff && *ff) {
+        sa.fontFamily = str::Dup(Str(ff));
+    }
+    sa.fontStyle = JsonInt(ctx, o, "textStyle", 0);
     sa.borderWidth = JsonInt(ctx, o, "borderWidth", -1);
     const char* ls = JsonStr(ctx, o, "lineStart");
     if (ls && *ls) {
@@ -1368,32 +1472,57 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
 // returns true if the page already contains this annotation: exact /NM
 // match first, then the type+rect heuristic (prevents duplicates when the
 // PDF embeds annotations that also exist in the sidecar)
+//
+// CRASH FIX: this whole scan must be exception-safe.
+//  - The raw pdf_annot_rect getter THROWS "argument error: ... have no
+//    Rect property" for derived-rect types (text markups / Ink / Line /
+//    Polygon) in this mupdf, and there is NO enclosing fz_try between
+//    here and the document-open code: an escaping longjmp would skip the
+//    C++ docLock guard in the caller and take the process down (observed:
+//    crash when importing the 2nd sidecar annotation of the same markup
+//    type, e.g. the second squiggly).
+//  - PdfAnnotBounds (pdf_bound_annot, incl. the ink-stroke special case)
+//    reads /Rect through the display-rect path with no subtype whitelist
+//    and is exactly what the exporter measured for "rect", so the
+//    heuristic now compares like with like (the old pdf_annot_rect also
+//    subtracted /RD, which the exported bounds never did).
 static bool PageHasAnnot(fz_context* ctx, pdf_page* page, const SidecarAnnot& a) {
-    pdf_annot* pa = pdf_first_annot(ctx, page);
-    if (len(a.name) > 0) {
-        while (pa) {
-            const char* nm = pdf_annot_name(ctx, pa);
-            if (nm && str::Eq(Str(nm), a.name)) {
-                return true;
+    bool found = false;
+    fz_try(ctx) {
+        pdf_annot* pa = pdf_first_annot(ctx, page);
+        if (len(a.name) > 0) {
+            while (pa) {
+                const char* nm = pdf_annot_name(ctx, pa);
+                if (nm && str::Eq(Str(nm), a.name)) {
+                    found = true;
+                    break;
+                }
+                pa = pdf_next_annot(ctx, pa);
+            }
+            if (!found) {
+                pa = pdf_first_annot(ctx, page);
+            }
+        }
+        while (!found && pa) {
+            auto pt = pdf_annot_type(ctx, pa);
+            if ((AnnotationType)pt == a.type) {
+                RectF rb = PdfAnnotBounds(ctx, pa);
+                if (fabsf(rb.x - a.bounds.x) < 1.0f && fabsf(rb.y - a.bounds.y) < 1.0f &&
+                    fabsf((rb.x + rb.dx) - (a.bounds.x + a.bounds.dx)) < 1.0f &&
+                    fabsf((rb.y + rb.dy) - (a.bounds.y + a.bounds.dy)) < 1.0f) {
+                    found = true;
+                    break;
+                }
             }
             pa = pdf_next_annot(ctx, pa);
         }
-        pa = pdf_first_annot(ctx, page);
     }
-    while (pa) {
-        auto pt = pdf_annot_type(ctx, pa);
-        if ((AnnotationType)pt == a.type) {
-            fz_rect r = pdf_annot_rect(ctx, pa);
-            RectF rb = ToRectF(r);
-            if (fabsf(rb.x - a.bounds.x) < 1.0f && fabsf(rb.y - a.bounds.y) < 1.0f &&
-                fabsf((rb.x + rb.dx) - (a.bounds.x + a.bounds.dx)) < 1.0f &&
-                fabsf((rb.y + rb.dy) - (a.bounds.y + a.bounds.dy)) < 1.0f) {
-                return true;
-            }
-        }
-        pa = pdf_next_annot(ctx, pa);
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+        logf("sidecar: dedup scan failed on page %d, importing anyway\n", a.pageNo);
+        found = false;
     }
-    return false;
+    return found;
 }
 
 // returns a kept pdf_annot* for MakeAnnotationWrapper, or nullptr on failure
@@ -1406,7 +1535,14 @@ static pdf_annot* CreateAnnotFromEntry(fz_context* ctx, pdf_page* page, const Si
         if (!pa) {
             return nullptr;
         }
-        if (!a.bounds.IsEmpty()) {
+        // pdf_set_annot_rect rejects annotations whose /Rect is derived
+        // from other data (QuadPoints / Vertices / InkList / Line
+        // endpoints, mupdf's rect_subtypes whitelist) with
+        // "argument error: ... annotations have no Rect property";
+        // mirror the official creation code (EngineMupdfCreateAnnotation)
+        // and only set the rect on types that own it. The rest get their
+        // /Rect derived from their geometry setters below.
+        if (!a.bounds.IsEmpty() && SidecarAnnotOwnsRect(a.type)) {
             pdf_set_annot_rect(ctx, pa, ToFzRect(a.bounds));
         }
         if (len(a.quads) > 0 && (AnnotationIsTextMarkup(a.type) || a.type == AnnotationType::Redact)) {
@@ -1579,6 +1715,21 @@ static int ImportSidecarEntries(EngineMupdf* e, const Vec<SidecarAnnot>& entries
             pdf_drop_annot(ctx, pa);
             continue;
         }
+        // FreeText styling: /DS must be written AFTER the /DA block in
+        // CreateAnnotFromEntry, because pdf_set_annot_default_appearance
+        // deletes /DS (and /RC) as "not supported" (pdf-annot.c). The /DS
+        // is what the appearance synthesizer renders the text with when
+        // the HTML engine is enabled (font family / bold / italic /
+        // underline); without it the text falls back to /DA's base font.
+        if (a.type == AnnotationType::FreeText && (len(a.fontFamily) > 0 || a.fontStyle != 0)) {
+            // SetFreeTextFont() ignores an empty family: fall back to the
+            // base font name the way the sidebar does
+            Str fam = a.fontFamily;
+            if (len(fam) == 0) {
+                fam = StrL("Helvetica");
+            }
+            SetFreeTextFont(wa, fam, a.fontStyle);
+        }
         // the engine's own bookkeeping: appends to pageInfo->annotations and
         // rebuilds the page comments, exactly like a user-created annotation
         MarkNotificationAsModified(e, wa, AnnotationChange::Add);
@@ -1704,7 +1855,8 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
 
     Vec<Annotation*> annots;
     EngineMupdfGetAnnotations(engine, annots);
-    Str json = BuildSidecarJson(e, annots, pdfPath);
+    int nSkippedUnsupported = 0;
+    Str json = BuildSidecarJson(e, annots, pdfPath, nSkippedUnsupported);
     if (len(json) == 0) {
         ShowWarningNotification(win->hwndCanvas, StrL("Failed to build JSON sidecar"), 5000);
         return SidecarResult::Failed;
@@ -1728,9 +1880,19 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
 
     e->modifiedAnnotations = false;
     ToolbarUpdateStateForWindow(win, true);
-    ShowPlainNotification(win->hwndCanvas, fmt(Tr("Saved annotations to '%s'").s, tgt.path), 5000);
-    logf("sidecar: saved %d annotations to '%s' (%s)\n", len(annots), tgt.path,
-         tgt.central ? StrL("central") : StrL("sibling"));
+    if (nSkippedUnsupported > 0) {
+        // make it visible that some annotations (stamp / file attachment)
+        // cannot live in the JSON sidecar and will be lost on reopen
+        ShowPlainNotification(
+            win->hwndCanvas,
+            fmt("Saved annotations to '%s' (%d skipped: unsupported types, not in sidecar)", tgt.path,
+                nSkippedUnsupported),
+            5000);
+    } else {
+        ShowPlainNotification(win->hwndCanvas, fmt(Tr("Saved annotations to '%s'").s, tgt.path), 5000);
+    }
+    logf("sidecar: saved %d annotations to '%s' (%s, %d skipped)\n", len(annots), tgt.path,
+         tgt.central ? StrL("central") : StrL("sibling"), nSkippedUnsupported);
     return SidecarResult::Saved;
 }
 
@@ -1775,8 +1937,12 @@ static void CALLBACK SidecarAutoSaveTimerProc(HWND hwnd, UINT msg, UINT_PTR id, 
     if (!tab) {
         return;
     }
-    // don't create sidecar files out of nowhere; only update existing ones
-    SidecarSaveTab(tab, /*allowCreate=*/false);
+    // this timer only ever fires after MarkNotificationAsModified(), i.e.
+    // the user really changed an annotation: creating the sidecar file here
+    // is intended - the FIRST annotation made on a document must create
+    // the file, otherwise it would only ever appear on manual save or
+    // tab close
+    SidecarSaveTab(tab, /*allowCreate=*/true);
 }
 
 void SidecarNotifyChanged(EngineBase* engine) {
