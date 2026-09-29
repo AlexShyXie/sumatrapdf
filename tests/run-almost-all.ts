@@ -122,6 +122,7 @@ import { testit as issue6225 } from "./issue-6225.ts";
 import { testit as issue6229 } from "./issue-6229.ts";
 import { testit as issue6245 } from "./issue-6245.ts";
 import { testit as issue6244 } from "./issue-6244.ts";
+import { testit as issue6246 } from "./issue-6246.ts";
 import { testit as ghsaP2ph2rvmQ37m } from "./security-ghsa-p2ph-2rvm-q37m.ts";
 import { testit as issue4753 } from "./issue-4753.ts";
 import { testit as issue4055 } from "./issue-4055.ts";
@@ -147,10 +148,13 @@ import { testit as showChaptersInEbooks } from "./show-chapters-in-ebooks.ts";
 import { testit as embeddedImageAttachment } from "./embedded-image-attachment.ts";
 import { testit as ttsEngineCrashRecovery } from "./tts-engine-crash-recovery.ts";
 import { testit as readAloudCloseDuringSpeak } from "./read-aloud-close-during-speak.ts";
+import { testit as readAloudRestyleStalePage } from "./read-aloud-restyle-stale-page.ts";
+import { testit as readAloudLazyChapters } from "./read-aloud-lazy-chapters.ts";
 import { testit as lazyTabStateAfterSave } from "./lazy-tab-state-after-save.ts";
 import { testit as lazyTabSelectPaint } from "./lazy-tab-select-paint.ts";
 import { testit as pendingTabFreedSessionState } from "./pending-tab-freed-session-state.ts";
 import { testit as closeTabDuringPlacement } from "./close-tab-during-placement.ts";
+import { testit as toggleZoomFailedTab } from "./toggle-zoom-failed-tab.ts";
 import { testit as restoreChmMissingTab } from "./restore-chm-missing-tab.ts";
 import { testit as issue5943 } from "./issue-5943.ts";
 import { testit as issue6117 } from "./issue-6117.ts";
@@ -376,6 +380,7 @@ export const tests: NamedTest[] = [
   ["issue-6229", issue6229],
   ["issue-6245", issue6245],
   ["issue-6244", issue6244],
+  ["issue-6246", issue6246],
   ["issue-6133", issue6133],
   ["issue-6184", issue6184],
   ["image-only-palette-items", imageOnlyPaletteItems],
@@ -394,10 +399,13 @@ export const tests: NamedTest[] = [
   ["embedded-image-attachment", embeddedImageAttachment],
   ["tts-engine-crash-recovery", ttsEngineCrashRecovery],
   ["read-aloud-close-during-speak", readAloudCloseDuringSpeak],
+  ["read-aloud-restyle-stale-page", readAloudRestyleStalePage],
+  ["read-aloud-lazy-chapters", readAloudLazyChapters],
   ["lazy-tab-state-after-save", lazyTabStateAfterSave],
   ["lazy-tab-select-paint", lazyTabSelectPaint],
   ["pending-tab-freed-session-state", pendingTabFreedSessionState],
   ["close-tab-during-placement", closeTabDuringPlacement],
+  ["toggle-zoom-failed-tab", toggleZoomFailedTab],
   ["restore-chm-missing-tab", restoreChmMissingTab],
   ["issue-4705", issue4705],
   ["toc-tree-sent-click", tocTreeSentClick],
