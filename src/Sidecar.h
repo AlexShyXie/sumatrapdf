@@ -19,17 +19,18 @@
 // then central. Saving resolves the target the same way, so both stay
 // consistent without extra per-tab state.
 //
-// Schema (version 1), one file per document:
+// Schema (version 2), one file per document:
 //
 //   {
-//     "version": 1,
+//     "version": 2,
 //     "title": "<pdf Info/Title, optional>",
 //     "annotations": [ { ... }, ... ]
 //   }
 //
 // Common annotation fields (all optional except type/page/rect):
 //   type         text|freetext|line|square|circle|polygon|polyline|
-//                highlight|underline|squiggly|strikeout|caret|ink|redact
+//                highlight|underline|squiggly|strikeout|caret|ink|redact|
+//                stamp|fileattachment
 //   page         0-based page number
 //   rect         [x0,y0,x1,y1]  PDF user space, like mupdf
 //   quads        [[ulX,ulY,urX,urY,llX,llY,lrX,lrY], ...]  markup+redact
@@ -40,7 +41,8 @@
 //   opacity      0..1 (omitted = 1)
 //   borderWidth  points
 //   lineStart/lineEnd  line ending style names (Square, Circle, ...)
-//   icon         Text note icon name
+//   icon         Text note icon name; stamp name ("Approved"...) for
+//                stamps; icon name ("PushPin"...) for file attachments
 //   isOpen       Text note popup state
 //   fontSize / textColor / textAlign  FreeText default appearance (/DA)
 //   fontFamily / textStyle   FreeText rich text (/DS CSS): family name and
@@ -48,6 +50,15 @@
 //   author / subject / contents / name(/NM) / text(excerpt under quads)
 //   creationDate / modDate   ISO-8601 UTC ("2026-09-28T12:00:00Z")
 //   flags        PDF annotation flags bits (print|nozoom|...)
+//
+// Stamp (image) and FileAttachment annotations carry binary payloads.
+// The JSON never holds binary data: payloads are written as
+// <json dir>/assets/<fnv1a-64-hex>.<ext> (content-addressed, deduped) and
+// referenced by "asset" ("assets/<hex>.<ext>", relative to the JSON, so
+// pdf+json+assets move together). Attachment metadata lives in an
+// "attachment" object (filename/mimeType/size/created/modified). On save
+// asset files that no sidecar in the folder references anymore are
+// deleted. Version 1 files (no asset fields) still parse.
 //
 // Why JSON and not XFDF: XFDF interop between viewers is de-facto, not
 // de-jure (quad ordering differs between implementations, richtext

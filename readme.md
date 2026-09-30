@@ -12,7 +12,7 @@ More Information:
 
 
 
-[简体中文](read-zh.md) | English
+[简体中文](readme-zh.md) | English
 
 A modified version of SumatraPDF: annotations are not written into the PDF, but saved to a JSON file stored alongside it.
 
@@ -20,15 +20,14 @@ Upstream repository: [sumatrapdfreader/SumatraPDF](https://github.com/sumatrapdf
 
 A PDF annotation sidecar (companion file) means annotation data is not written into the PDF itself, but saved as a separate file with the same name in the same directory (e.g., `book.pdf` → `book.json`). When opening the PDF, the sidecar file is loaded automatically; when editing annotations, only this small (a few KB) file is rewritten, leaving the PDF untouched — especially useful for large PDFs stored on sync services like OneDrive, since a single annotation edit won’t trigger a full re-upload of a 600 MB file. The trade-off: other PDF readers won’t show the annotations, because the data isn’t inside the PDF.
 
-
-
 ## Why
 
-My PDF library contains several single-file scanned documents of hundreds of megabytes, synced via OneDrive. Once SumatraPDF's annotation feature is enabled, every stroke rewrites the entire PDF — for a 600MB file, changing a single byte means OneDrive has to re-upload the whole thing. Turning off annotations, on the other hand, means giving up half the value of a reader.
+> SumatraPDF originally supported saving annotations as pure text files with the same name as the PDF, with the last supported version being 3.2. 
+> Okular, in its early stages, saved annotations as hidden XML files, with the last supported version being 1.2. Both companies actively removed this feature around 2018 and explicitly stated that it would not be restored. 
+> The core reasons for abandoning this feature were threefold: the sidecar file easily becomes disconnected after renaming or saving the file under a different name, causing a perceived "data loss"; the pure text format could not support complex types of annotations; and the maintenance cost was high due to the lack of unified coordinate units across different formats. The maturity of embedded annotations in the standard PDF ultimately led to the complete discontinuation of this independent storage approach.
 
-The official codebase of the PDF implementation was removed a few years ago. This repository re-implements it the PDF way, storing JSON.
-
-The result: opening a PDF with annotations leaves the modification time of the PDF file itself untouched. All annotation data lives in the adjacent `.json` file.
+The industry consensus is that annotations should follow the file, but in some scenarios, this is precisely a disaster: my PDF library contains hundreds of megabytes of single-file scanned documents, synchronized on OneDrive. Once the annotation feature of SumatraPDF is enabled, modifying the entire PDF every time a line is drawn - a 600MB file, with OneDrive needing to re-upload the entire file even for a single byte change; disabling annotations is equivalent to giving up half the value of the reader.
+Therefore, I prefer the sidecar approach: when opening a PDF with annotations, the modification time of the PDF file itself is zero. All annotation data is stored in a separate `.json` file.
 
 ## How It Works
 
@@ -56,15 +55,16 @@ Annotations [
 
 ## Supported Annotation Types
 
-14 types, with full round-trip property support:
+16 types, with full round-trip property support:
 
-Text (sticky note), FreeText (text box), Highlight, Underline, Squiggly, StrikeOut, Line, Square, Circle, Polygon, PolyLine, Ink, Caret, Redact
+Text (sticky note), FreeText (text box), Highlight, Underline, Squiggly, StrikeOut, Line, Square, Circle, Polygon, PolyLine, Ink, Caret, Redact, Stamp, FileAttachment
 
 FreeText supports font, font size, text color, alignment, bold, italic, underline, and transparent background. For all types, colors (including none/transparent), opacity, borders, author, and timestamps are preserved.
 
+Stamp and FileAttachment carry binary payloads (images, embedded files), which the JSON never holds: payloads are written to an `assets/` folder next to the JSON, named by content hash (`assets/<hash>.<ext>`) and referenced by relative path. Identical payloads are deduplicated, and asset files no longer referenced by any sidecar in the folder are deleted on save. Sidecar files from the previous format (no asset fields) still load.
+
 ## Known Limitations
 
-- **Stamp and FileAttachment are not supported.** Their data consists of embedded images and files, which are not placed in the JSON as binaries. When saving, these two types of annotations are skipped and counted; the status bar will indicate how many were skipped.
 - **No conflict merging.** If two machines modify the same sidecar simultaneously, the last save overwrites the earlier one. Fine for single-user use.
 - Large annotations have defensive limits: 512 vertices for polygons/polylines, 64 strokes for ink, with at most 2048 points per stroke. Anything beyond these limits is truncated.
 - Other readers won't see the annotations when opening this PDF — the data lives in the JSON, not in the PDF. This is by design.

@@ -37,7 +37,7 @@
 //     {
 //       "type": "highlight",          // text freetext line square circle polygon
 //                                      // polyline underline squiggly strikeout
-//                                      // caret ink redact
+//                                      // caret ink redact stamp fileattachment
 //       "page": 29,                   // 0-based page number
 //       "rect": [53.81,502.57,476.23,527.08],   // PDF user space [llx,lly,urx,ury]
 //       "quads": [[ul.x,ul.y,ur.x,ur.y,ll.x,ll.y,lr.x,lr.y],…],  // text markups
@@ -51,7 +51,17 @@
 //       "borderWidth": 2,
 //       "lineStart": "OpenArrow",      // line ending styles
 //       "lineEnd": "None",
-//       "icon": "Comment",            // text annotation icon
+//       "icon": "Comment",            // text annotation icon; stamp name
+//                                      // ("Approved"...) for stamps, icon for
+//                                      // file attachments
+//       "asset": "assets/1a2b...png", // stamp/attachment payload, relative
+//                                      // to this JSON (content-addressed)
+//       "attachment": {               // file attachment metadata
+//         "filename": "notes.txt", "mimeType": "text/plain",
+//         "size": 1234,
+//         "created": "…", "modified": "…",
+//         "asset": "assets/9ab1...txt"
+//       },
 //       "isOpen": false,              // text annotation popup open
 //       "fontSize": 12,               // freetext
 //       "textAlign": 0,               // freetext: 0 left, 1 center, 2 right
@@ -78,6 +88,7 @@
 // Settings.h fields, premake5.files.lua entry).
 
 #include "base/Base.h"
+#include "base/DirScan.h"
 #include "base/File.h"
 #include "base/GuessFileType.h"
 #include "base/Win.h"
@@ -257,6 +268,8 @@ static bool SidecarAnnotOwnsRect(AnnotationType tp) {
         case AnnotationType::Circle:
         case AnnotationType::Redact:
         case AnnotationType::Caret:
+        case AnnotationType::Stamp:
+        case AnnotationType::FileAttachment:
             return true;
         default:
             return false;
@@ -285,6 +298,18 @@ struct SidecarAnnot {
     int flags = -1;      // PDF annotation flag bits
     time_t creationDate = 0;
     time_t modDate = 0;
+    // stamp / file attachment payload: the bytes live in an assets/ folder
+    // next to the JSON ("assets/<fnv1a-64-hex>.<ext>", content-addressed so
+    // identical payloads share one file); "asset" in the JSON is relative to
+    // the JSON itself, so pdf+json+assets move together
+    Str assetName;                 // "assets/1a2b3c....png", empty when no payload
+    fz_buffer* assetBuf = nullptr; // owned payload bytes while in flight
+    bool assetOk = true;           // false: payload expected but unextractable
+    Str attachName;                // file attachment: original file name
+    Str attachMime;                // file attachment: MIME type
+    int attachSize = -1;           // file attachment: payload size in bytes
+    time_t attachCreated = 0;
+    time_t attachModified = 0;
     // free text extras
     int textSize = -1;
     float textColor[3] = {0, 0, 0};
@@ -320,7 +345,11 @@ static bool gSidecarImporting = false;
 
 // SidecarAnnot string fields are heap-dups on both the collect and the read
 // path; release them once the entry is no longer needed
-static void FreeSidecarAnnotStrings(SidecarAnnot& sa) {
+static void FreeSidecarAnnotStrings(fz_context* ctx, SidecarAnnot& sa) {
+    if (ctx && sa.assetBuf) {
+        fz_drop_buffer(ctx, sa.assetBuf);
+        sa.assetBuf = nullptr;
+    }
     str::Free(sa.contents);
     str::Free(sa.author);
     str::Free(sa.subject);
@@ -328,12 +357,18 @@ static void FreeSidecarAnnotStrings(SidecarAnnot& sa) {
     str::Free(sa.icon);
     str::Free(sa.text);
     str::Free(sa.fontFamily);
+    str::Free(sa.assetName);
+    str::Free(sa.attachName);
+    str::Free(sa.attachMime);
     sa.contents = {};
     sa.author = {};
     sa.subject = {};
     sa.name = {};
     sa.icon = {};
     sa.text = {};
+    sa.assetName = {};
+    sa.attachName = {};
+    sa.attachMime = {};
 }
 
 static bool SidecarTypeSupported(AnnotationType tp) {
@@ -352,10 +387,14 @@ static bool SidecarTypeSupported(AnnotationType tp) {
         case AnnotationType::Caret:
         case AnnotationType::Ink:
         case AnnotationType::Redact:
+        case AnnotationType::Stamp:
+        case AnnotationType::FileAttachment:
             return true;
         default:
-            // Link / Popup / Widget / Stamp (image payload) / FileAttachment
-            // (payload) / media types: not supported
+            // Link / Popup / Widget / Sound / Movie / RichMedia / media
+            // types: not supported. Stamps and file attachments are
+            // supported since schema version 2: their payloads live in an
+            // assets/ folder next to the JSON, not in the JSON itself
             return false;
     }
 }
@@ -390,6 +429,10 @@ static const char* SidecarNameForType(AnnotationType tp) {
             return "ink";
         case AnnotationType::Redact:
             return "redact";
+        case AnnotationType::Stamp:
+            return "stamp";
+        case AnnotationType::FileAttachment:
+            return "fileattachment";
         default:
             return nullptr;
     }
@@ -502,6 +545,430 @@ static void PdfColorToF(PdfColor col, float out[3]) {
     out[0] = r / 255.0f;
     out[1] = g / 255.0f;
     out[2] = b / 255.0f;
+}
+
+// ---------------------------------------------------------------------------
+// assets: binary payloads of stamp and file attachment annotations.
+// The JSON never holds binary data; payloads are written as
+// <json dir>/assets/<fnv1a-64-hex>.<ext> and referenced from the JSON by
+// their relative path. Content-addressed names dedup identical payloads
+// and make the cleanup in SaveTab safe.
+
+static uint64_t Fnv1a64(const u8* d, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)d[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static Str AssetPathForData(const u8* d, size_t n, const char* ext) {
+    uint64_t h = Fnv1a64(d, n);
+    str::Builder b;
+    // FmtArg rejects raw char*: wrap the extension (NUL-terminated) in a Str
+    b.Append(fmt("assets/%08x%08x.%s", (uint32_t)(h >> 32), (uint32_t)h, Str(ext)));
+    return b.TakeStr();
+}
+
+// "1a2b3c4d5e6f7080.png": 16 lowercase hex chars, a dot, 1-12 lowercase
+// alphanumeric extension. Only files matching this exact pattern are ever
+// touched by the cleanup, so anything a user puts into assets/ stays put
+static bool IsHexAssetName(Str name) {
+    if (len(name) < 16 + 2 || len(name) > 16 + 1 + 12) {
+        return false;
+    }
+    for (int i = 0; i < 16; i++) {
+        char c = name.s[i];
+        bool hexChar = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!hexChar) {
+            return false;
+        }
+    }
+    if (name.s[16] != '.') {
+        return false;
+    }
+    for (int i = 17; i < len(name); i++) {
+        char c = name.s[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// only exact "assets/<hex name>" references are accepted; the writer always
+// produces this shape, so anything else ("..", absolute paths, drive
+// letters) is rejected before it ever reaches the file system
+static bool IsSafeAssetRelPath(Str p) {
+    constexpr int kPrefix = 7; // "assets/"
+    if (len(p) < kPrefix + 16 + 2 || len(p) > kPrefix + 16 + 1 + 12) {
+        return false;
+    }
+    if (!str::StartsWith(p, StrL("assets/"))) {
+        return false;
+    }
+    return IsHexAssetName(Str(p.s + kPrefix, len(p) - kPrefix));
+}
+
+static bool StrContains(Str hay, Str needle) {
+    if (len(needle) == 0 || len(hay) < len(needle)) {
+        return false;
+    }
+    int max = len(hay) - len(needle);
+    for (int i = 0; i <= max; i++) {
+        if (0 == memcmp(hay.s + i, needle.s, len(needle))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// picks the asset file extension for an attachment's file name: last
+// dot-separated token, sanitized to [a-z0-9], max 10 chars, "bin" fallback
+static void AssetExtForFileName(Str fn, char* out, size_t outCap) {
+    int start = -1;
+    for (int i = len(fn) - 1; i >= 0; i--) {
+        if (fn.s[i] == '.') {
+            start = i + 1;
+            break;
+        }
+    }
+    int n = 0;
+    if (start > 0) {
+        for (int i = start; i < len(fn) && n < (int)outCap - 1; i++) {
+            char c = fn.s[i];
+            if (c >= 'A' && c <= 'Z') {
+                c = (char)(c - 'A' + 'a');
+            }
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                out[n++] = c;
+            }
+        }
+    }
+    if (n == 0) {
+        out[0] = 'b';
+        out[1] = 'i';
+        out[2] = 'n';
+        out[3] = 0;
+        return;
+    }
+    out[n] = 0;
+}
+
+// decodes a stamp image into a PNG buffer. fz_new_buffer_from_image_as_png
+// alone drops the /SMask transparency (it decodes the base image only), so
+// the soft mask is composited into the PNG alpha channel here
+static fz_buffer* PngFromStampImage(fz_context* ctx, fz_image* img) {
+    fz_pixmap* pm = nullptr;
+    fz_pixmap* mask = nullptr;
+    fz_pixmap* out = nullptr;
+    fz_buffer* res = nullptr;
+    fz_var(pm);
+    fz_var(mask);
+    fz_var(out);
+    fz_var(res);
+    fz_try(ctx) {
+        pm = fz_get_pixmap_from_image(ctx, img, nullptr, nullptr, nullptr, nullptr);
+        if (!pm || pm->w <= 0 || pm->h <= 0) {
+            fz_throw(ctx, FZ_ERROR_FORMAT, "stamp image decode failed");
+        }
+        // exotic colorspaces (CMYK, Indexed, ...) become gray/rgb: the PNG
+        // writer only handles those
+        fz_colorspace* cs = pm->colorspace;
+        bool gray = !cs || fz_colorspace_is_gray(ctx, cs);
+        if (!gray && !fz_colorspace_is_rgb(ctx, cs)) {
+            fz_pixmap* cv =
+                fz_convert_pixmap(ctx, pm, fz_device_rgb(ctx), nullptr, nullptr, fz_default_color_params, 0);
+            fz_drop_pixmap(ctx, pm);
+            pm = cv;
+            gray = fz_colorspace_is_gray(ctx, pm->colorspace);
+        }
+        int useMask = 0;
+        if (img->mask) {
+            mask = fz_get_pixmap_from_image(ctx, img->mask, nullptr, nullptr, nullptr, nullptr);
+            useMask = (mask && mask->w == pm->w && mask->h == pm->h) ? 1 : 0;
+        }
+        int ncol = pm->n - pm->alpha - pm->s;
+        if (ncol > 3) {
+            ncol = 3;
+        }
+        if (ncol < 1) {
+            ncol = 1;
+        }
+        // a PDF image renders as base color x /SMask; pdf_add_image stores
+        // straight-alpha pixmaps that way (base = color * 255 / alpha). To
+        // make the PNG a correct straight-alpha image AND the re-import
+        // (which runs the same pdf_add_image conversion) reproduce the same
+        // base, the mask is multiplied back into the colors here
+        int hasAlpha = useMask || pm->alpha;
+        out = fz_new_pixmap(ctx, gray ? fz_device_gray(ctx) : fz_device_rgb(ctx), pm->w, pm->h, nullptr, hasAlpha);
+        for (int y = 0; y < pm->h; y++) {
+            const u8* s = pm->samples + (size_t)y * pm->stride;
+            const u8* m = useMask ? (mask->samples + (size_t)y * mask->stride) : nullptr;
+            u8* d = out->samples + (size_t)y * out->stride;
+            for (int x = 0; x < pm->w; x++) {
+                if (useMask) {
+                    int a = m[x * (mask->n > 0 ? mask->n : 1)];
+                    for (int c = 0; c < ncol; c++) {
+                        d[c] = (u8)((s[c] * a + 127) / 255);
+                    }
+                    d[ncol] = (u8)a;
+                } else {
+                    for (int c = 0; c < ncol; c++) {
+                        d[c] = s[c];
+                    }
+                    if (out->alpha) {
+                        d[ncol] = pm->alpha ? s[ncol] : 255;
+                    }
+                }
+                s += pm->n;
+                d += out->n;
+            }
+        }
+        res = fz_new_buffer_from_pixmap_as_png(ctx, out, fz_default_color_params);
+    }
+    fz_always(ctx) {
+        fz_drop_pixmap(ctx, pm);
+        fz_drop_pixmap(ctx, mask);
+        fz_drop_pixmap(ctx, out);
+    }
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+        fz_drop_buffer(ctx, res);
+        res = nullptr;
+    }
+    return res;
+}
+
+// extracts the payload bytes of a stamp (image XObject) or a file
+// attachment (embedded file) into sa.assetBuf and computes sa.assetName.
+// A stamp without an image (rubber stamp: "Approved" etc.) carries no
+// payload at all. Sets assetOk=false when a payload exists but cannot be
+// extracted; the entry is then skipped and counted on save.
+static void CollectAssetPayload(Annotation* a, SidecarAnnot& sa) {
+    EngineMupdf* e = a->engine;
+    if (!e || !a->pdfannot) {
+        return;
+    }
+    AutoUnlockRecursiveMutex cs(&e->docLock);
+    fz_context* ctx = e->Ctx();
+    fz_buffer* buf = nullptr;
+    fz_var(buf);
+    fz_try(ctx) {
+        if (sa.type == AnnotationType::Stamp) {
+            pdf_obj* imgobj = pdf_annot_stamp_image_obj(ctx, a->pdfannot);
+            if (imgobj) {
+                const char* ext = "png";
+                fz_image* img = pdf_load_image(ctx, e->pdfdoc, imgobj);
+                fz_try(ctx) {
+                    fz_compressed_buffer* cb = fz_compressed_image_buffer(ctx, img);
+                    if (cb && cb->params.type == FZ_IMAGE_JPEG && !img->use_decode && !img->mask) {
+                        // a plain DCT stream is a standalone JPEG file: keep the
+                        // original bytes for a byte-identical round-trip
+                        buf = fz_keep_buffer(ctx, cb->buffer);
+                        ext = "jpg";
+                    } else {
+                        buf = PngFromStampImage(ctx, img);
+                    }
+                    if (!buf || buf->len == 0) {
+                        fz_throw(ctx, FZ_ERROR_FORMAT, "stamp image extraction failed");
+                    }
+                }
+                fz_always(ctx) {
+                    fz_drop_image(ctx, img);
+                }
+                fz_catch(ctx) {
+                    fz_rethrow(ctx);
+                }
+                sa.assetName = AssetPathForData(buf->data, buf->len, ext);
+                sa.assetBuf = buf;
+                buf = nullptr; // ownership moved into sa
+            }
+            // no image: a rubber stamp ("Approved" etc.) is /Name + rect
+            // only - no asset file (never return from inside fz_try: the
+            // exception frame is only popped by fz_catch)
+        } else if (sa.type == AnnotationType::FileAttachment) {
+            pdf_obj* fs = pdf_annot_filespec(ctx, a->pdfannot);
+            if (fs && pdf_is_embedded_file(ctx, fs)) {
+                pdf_filespec_params p{};
+                pdf_get_filespec_params(ctx, fs, &p);
+                if (p.filename && *p.filename) {
+                    sa.attachName = str::Dup(Str(p.filename));
+                }
+                if (p.mimetype && *p.mimetype) {
+                    sa.attachMime = str::Dup(Str(p.mimetype));
+                }
+                sa.attachSize = p.size;
+                if (p.created > 0) {
+                    sa.attachCreated = (time_t)p.created;
+                }
+                if (p.modified > 0) {
+                    sa.attachModified = (time_t)p.modified;
+                }
+                buf = pdf_load_embedded_file_contents(ctx, fs);
+                if (!buf || buf->len == 0) {
+                    fz_throw(ctx, FZ_ERROR_FORMAT, "attachment is empty");
+                }
+                char ext[12] = {};
+                AssetExtForFileName(sa.attachName, ext, dimofi(ext));
+                sa.assetName = AssetPathForData(buf->data, buf->len, ext);
+                sa.assetBuf = buf;
+                buf = nullptr; // ownership moved into sa
+            } else {
+                // external file specification: points at a file on the
+                // author's machine, nothing embeddable to persist
+                sa.assetOk = false;
+            }
+        }
+    }
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+        fz_drop_buffer(ctx, buf);
+        logf("sidecar: failed to extract %s payload on page %d\n",
+             sa.type == AnnotationType::Stamp ? StrL("stamp") : StrL("attachment"), sa.pageNo);
+        sa.assetOk = false;
+    }
+}
+
+// writes the payload files referenced by entries into assets/ next to the
+// JSON. Returns the number of failed writes. Content-addressed names make
+// this idempotent: unchanged payloads are simply overwritten in place
+static int WriteSidecarAssets(Str jsonPath, const Vec<SidecarAnnot>& entries) {
+    bool any = false;
+    for (const SidecarAnnot& sa : entries) {
+        if (sa.assetBuf && len(sa.assetName) > 0) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return 0;
+    }
+    TempStr jdir = path::GetDirTemp(jsonPath);
+    if (len(jdir) == 0) {
+        return 1;
+    }
+    TempStr assetsDir = path::JoinTemp(jdir, StrL("assets"));
+    if (!dir::Exists(assetsDir) && !dir::CreateAll(assetsDir)) {
+        logf("sidecar: cannot create '%s'\n", assetsDir);
+        return 1;
+    }
+    int failed = 0;
+    Vec<Str> written; // borrowed names, dedups within one save
+    for (const SidecarAnnot& sa : entries) {
+        if (!sa.assetBuf || len(sa.assetName) == 0) {
+            continue;
+        }
+        bool done = false;
+        for (Str w : written) {
+            if (str::Eq(w, sa.assetName)) {
+                done = true;
+                break;
+            }
+        }
+        if (done) {
+            continue;
+        }
+        VecAppend(written, sa.assetName);
+        TempStr dst = path::JoinTemp(jdir, sa.assetName);
+        Str data((char*)sa.assetBuf->data, (int)sa.assetBuf->len);
+        if (!file::WriteFile(dst, data)) {
+            logf("sidecar: failed to write asset '%s'\n", dst);
+            failed++;
+        }
+    }
+    return failed;
+}
+
+// reads the payload files referenced by entries (relative to the JSON's
+// directory). Entries whose file is missing or unreadable get assetOk=false
+// and are skipped by the import; every entry owns its buffer copy
+static void LoadSidecarAssetBuffers(fz_context* ctx, Str jsonPath, Vec<SidecarAnnot>& entries) {
+    TempStr jdir = path::GetDirTemp(jsonPath);
+    if (len(jdir) == 0) {
+        return;
+    }
+    for (SidecarAnnot& sa : entries) {
+        if (len(sa.assetName) == 0 || !sa.assetOk) {
+            continue;
+        }
+        TempStr p = path::JoinTemp(jdir, sa.assetName);
+        Str data = file::ReadFile(p);
+        if (len(data) == 0) {
+            logf("sidecar: asset '%s' is missing or empty\n", sa.assetName);
+            sa.assetOk = false;
+            continue;
+        }
+        fz_buffer* buf = nullptr;
+        fz_try(ctx) {
+            buf = fz_new_buffer_from_copied_data(ctx, (const unsigned char*)data.s, (size_t)data.len);
+        }
+        fz_catch(ctx) {
+            fz_report_error(ctx);
+            buf = nullptr;
+        }
+        str::Free(data);
+        if (!buf) {
+            sa.assetOk = false;
+            continue;
+        }
+        sa.assetBuf = buf;
+    }
+}
+
+// after a save: delete files in assets/ that look like ours (16-hex names)
+// and are not referenced by ANY sidecar JSON in the folder (raw text scan:
+// the hex string appears verbatim in the referencing JSON, so assets
+// shared with other documents' sidecars are never removed)
+static void CleanupSidecarAssets(Str jsonPath) {
+    TempStr jdir = path::GetDirTemp(jsonPath);
+    if (len(jdir) == 0) {
+        return;
+    }
+    TempStr assetsDir = path::JoinTemp(jdir, StrL("assets"));
+    if (!dir::Exists(assetsDir)) {
+        return;
+    }
+    Vec<Str> jsons; // owned
+    for (DirIterEntry* de : DirIter(jdir)) {
+        if (!de->isFile || !str::EndsWithI(de->name, StrL(".json"))) {
+            continue;
+        }
+        Str data = file::ReadFile(de->filePath);
+        // an unreadable or empty json simply contributes no references
+        if (len(data) > 0) {
+            VecAppend(jsons, data);
+        }
+    }
+    int nDeleted = 0;
+    for (DirIterEntry* de : DirIter(assetsDir)) {
+        if (!de->isFile || !IsHexAssetName(de->name)) {
+            continue; // never touch anything that doesn't match our pattern
+        }
+        TempStr hex = Str(de->name.s, 16);
+        bool referenced = false;
+        for (Str j : jsons) {
+            if (StrContains(j, hex)) {
+                referenced = true;
+                break;
+            }
+        }
+        if (!referenced) {
+            if (file::Delete(de->filePath)) {
+                nDeleted++;
+            } else {
+                logf("sidecar: cleanup could not delete '%s'\n", de->filePath);
+            }
+        }
+    }
+    for (Str j : jsons) {
+        str::Free(j);
+    }
+    if (nDeleted > 0) {
+        logf("sidecar: removed %d unreferenced asset file(s) from '%s'\n", nDeleted, assetsDir);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +1189,11 @@ static void CollectSidecarAnnot(Annotation* a, SidecarAnnot& sa, StextCache& cac
     t = IconName(a);
     sa.icon = len(t) > 0 ? str::Dup(t) : Str{};
     sa.modDate = ModificationDate(a);
+    // stamps and file attachments carry a binary payload: extract it into
+    // an owned buffer + compute the content-addressed asset name
+    if (a->type == AnnotationType::Stamp || a->type == AnnotationType::FileAttachment) {
+        CollectAssetPayload(a, sa);
+    }
 
     // only write color when the annotation has a REAL one (n > 0): an
     // absent /C or the empty /C [] of a "none"/transparent background must
@@ -992,9 +1464,42 @@ static void SerializeAnnotJson(str::Builder& b, const SidecarAnnot& sa) {
         b.Append(fmt(",\n      \"lineStart\": \"%s\",\n      \"lineEnd\": \"%s\"", Str(kLineEndingNames[ls]),
                      Str(kLineEndingNames[le])));
     }
-    if (sa.type == AnnotationType::Text && len(sa.icon) > 0) {
+    if ((sa.type == AnnotationType::Text || sa.type == AnnotationType::Stamp ||
+         sa.type == AnnotationType::FileAttachment) &&
+        len(sa.icon) > 0) {
         b.Append(StrL(",\n      \"icon\": "));
         AppendEscapedJson(b, sa.icon);
+    }
+    if (len(sa.assetName) > 0) {
+        // relative to this JSON: "assets/<fnv1a-64-hex>.<ext>"
+        b.Append(StrL(",\n      \"asset\": "));
+        AppendEscapedJson(b, sa.assetName);
+    }
+    if (sa.type == AnnotationType::FileAttachment && len(sa.attachName) > 0) {
+        b.Append(StrL(",\n      \"attachment\": {\n        \"filename\": "));
+        AppendEscapedJson(b, sa.attachName);
+        if (len(sa.attachMime) > 0) {
+            b.Append(StrL(",\n        \"mimeType\": "));
+            AppendEscapedJson(b, sa.attachMime);
+        }
+        if (sa.attachSize >= 0) {
+            b.Append(fmt(",\n        \"size\": %d", sa.attachSize));
+        }
+        if (sa.attachCreated > 0) {
+            Str d = FormatIsoDate(sa.attachCreated);
+            if (len(d) > 0) {
+                b.Append(StrL(",\n        \"created\": "));
+                AppendEscapedJson(b, d);
+            }
+        }
+        if (sa.attachModified > 0) {
+            Str d = FormatIsoDate(sa.attachModified);
+            if (len(d) > 0) {
+                b.Append(StrL(",\n        \"modified\": "));
+                AppendEscapedJson(b, d);
+            }
+        }
+        b.Append(StrL("\n      }"));
     }
     if (sa.type == AnnotationType::Text && sa.isOpen) {
         b.Append(StrL(",\n      \"isOpen\": true"));
@@ -1082,12 +1587,11 @@ static Str DocTitle(EngineMupdf* e) {
     return str::Dup(Str(buf, n - 1));
 }
 
-static constexpr int kSidecarVersion = 1;
+static constexpr int kSidecarVersion = 2;
 
-static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str pdfPath,
-                            int& nSkippedUnsupported) {
+static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str pdfPath, int& nSkippedUnsupported,
+                            Vec<SidecarAnnot>& entries) {
     nSkippedUnsupported = 0;
-    Vec<SidecarAnnot> entries;
     StextCache cache;
     cache.e = e;
     int nWritten = 0;
@@ -1096,16 +1600,19 @@ static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str 
             continue;
         }
         if (!SidecarTypeSupported(a->type)) {
-            // stamp (image payload) and file attachment (embedded file
-            // payload) cannot be represented in the JSON schema; count them
-            // so the user learns why they don't come back after a reopen
+            // unsupported types (link / popup / widget / media ...) and
+            // payloads that could not be extracted are counted so the user
+            // learns why they don't come back after a reopen
             nSkippedUnsupported++;
             continue;
         }
         SidecarAnnot sa;
         CollectSidecarAnnot(a, sa, cache);
-        if (sa.pageNo < 1 || sa.bounds.IsEmpty()) {
-            FreeSidecarAnnotStrings(sa);
+        if (sa.pageNo < 1 || sa.bounds.IsEmpty() || !sa.assetOk) {
+            if (!sa.assetOk) {
+                nSkippedUnsupported++;
+            }
+            FreeSidecarAnnotStrings(e->Ctx(), sa);
             continue;
         }
         VecAppend(entries, std::move(sa));
@@ -1114,7 +1621,7 @@ static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str 
     StextCacheReset(cache);
 
     str::Builder b;
-    b.Append(fmt("{\n  \"version\": %d,\n  \"generator\": \"SumatraPDF-sidecar/1\",\n", kSidecarVersion));
+    b.Append(fmt("{\n  \"version\": %d,\n  \"generator\": \"SumatraPDF-sidecar/2\",\n", kSidecarVersion));
     TempStr base = path::GetBaseNameTemp(pdfPath);
     if (base && len(base) > 0) {
         b.Append(StrL("  \"file\": "));
@@ -1143,10 +1650,8 @@ static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str 
     }
     b.Append(StrL("  ]\n}\n"));
     logf("sidecar: exported %d annotations\n", nWritten);
-    // the collect side heap-dups its strings: release them after serializing
-    for (SidecarAnnot& sa : entries) {
-        FreeSidecarAnnotStrings(sa);
-    }
+    // entries (including their payload buffers) move to the caller, which
+    // writes the asset files and then releases them
     return b.TakeStr();
 }
 
@@ -1406,6 +1911,40 @@ static bool JsonToSidecarAnnot(fz_context* ctx, fz_json* o, SidecarAnnot& sa) {
         sa.modDate = ParseIsoDate(Str(md));
     }
 
+    // stamp / attachment payload reference: strict shape check, the file
+    // system is only touched for exact "assets/<16-hex>.<ext>" paths
+    const char* asset = JsonStr(ctx, o, "asset");
+    if (asset && *asset) {
+        if (!IsSafeAssetRelPath(Str(asset))) {
+            return false;
+        }
+        sa.assetName = str::Dup(Str(asset));
+    }
+    fz_json* att = JsonGet(ctx, o, "attachment");
+    if (att && fz_json_is_object(ctx, att)) {
+        const char* fn = JsonStr(ctx, att, "filename");
+        if (fn && *fn) {
+            sa.attachName = str::Dup(Str(fn));
+        }
+        const char* mime = JsonStr(ctx, att, "mimeType");
+        if (mime && *mime) {
+            sa.attachMime = str::Dup(Str(mime));
+        }
+        sa.attachSize = JsonInt(ctx, att, "size", -1);
+        const char* ac = JsonStr(ctx, att, "created");
+        if (ac && *ac) {
+            sa.attachCreated = ParseIsoDate(Str(ac));
+        }
+        const char* am = JsonStr(ctx, att, "modified");
+        if (am && *am) {
+            sa.attachModified = ParseIsoDate(Str(am));
+        }
+    }
+    // a file attachment without its payload is just a dead icon: drop it
+    if (sa.type == AnnotationType::FileAttachment && len(sa.assetName) == 0) {
+        return false;
+    }
+
     // sanity per type: a markup without quads, a line without points, a
     // polygon without vertices and an ink without strokes are useless
     if (AnnotationIsTextMarkup(sa.type) && len(sa.quads) == 0) {
@@ -1451,7 +1990,7 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
                 } else {
                     // strings may already have been dup'ed before the
                     // per-type sanity check rejected the entry
-                    FreeSidecarAnnotStrings(sa);
+                    FreeSidecarAnnotStrings(ctx, sa);
                 }
             }
         }
@@ -1629,13 +2168,39 @@ static pdf_annot* CreateAnnotFromEntry(fz_context* ctx, pdf_page* page, const Si
         if (a.flags >= 0) {
             pdf_set_annot_flags(ctx, pa, a.flags);
         }
-        if (a.type == AnnotationType::Text) {
+        if (a.type == AnnotationType::Text || a.type == AnnotationType::Stamp ||
+            a.type == AnnotationType::FileAttachment) {
+            // icon: text note icons, stamp names ("Approved" ...), file
+            // attachment icons ("PushPin", "Graph" ...) all live in /Name
             if (len(a.icon) > 0) {
                 pdf_set_annot_icon_name(ctx, pa, CStrTemp(a.icon));
             }
-            if (a.isOpen) {
-                pdf_set_annot_is_open(ctx, pa, 1);
+        }
+        if (a.type == AnnotationType::Text && a.isOpen) {
+            pdf_set_annot_is_open(ctx, pa, 1);
+        }
+        if (a.type == AnnotationType::Stamp && a.assetBuf) {
+            // image stamp: embed the image and let mupdf rebuild /AP from
+            // it (pdf_set_annot_stamp_image_obj resets the appearance);
+            // JPEG bytes stay compressed, PNG decodes to a pixmap
+            fz_image* img = fz_new_image_from_buffer(ctx, a.assetBuf);
+            pdf_set_annot_stamp_image(ctx, pa, img);
+            fz_drop_image(ctx, img);
+        }
+        if (a.type == AnnotationType::FileAttachment && a.assetBuf) {
+            // recreate the embedded file exactly like the app's own
+            // "attach file" code (Annotation.cpp): the filespec keeps the
+            // original name / MIME type / dates, the buffer is copied by
+            // mupdf so the entry keeps owning its bytes
+            Str fn = a.attachName;
+            if (len(fn) == 0) {
+                fn = StrL("attachment.bin");
             }
+            pdf_obj* fs = pdf_add_embedded_file(ctx, page->doc, CStrTemp(fn),
+                                                len(a.attachMime) > 0 ? CStrTemp(a.attachMime) : nullptr, a.assetBuf,
+                                                (int64_t)a.attachCreated, (int64_t)a.attachModified, 1);
+            pdf_set_annot_filespec(ctx, pa, fs);
+            pdf_drop_obj(ctx, fs);
         }
         if (a.type == AnnotationType::FreeText) {
             // note: font family is not preserved (Helvetica fallback);
@@ -1730,6 +2295,11 @@ static int ImportSidecarEntries(EngineMupdf* e, const Vec<SidecarAnnot>& entries
     FzPageInfo* pi = nullptr;
     for (int ix : order) {
         const SidecarAnnot& a = entries[ix];
+        // payload (stamp image / attachment file) unreadable: importing a
+        // hollow annotation would silently lose the content
+        if (!a.assetOk) {
+            continue;
+        }
         // GetFzPageInfo takes pagesLock: must run OUTSIDE docLock
         if (a.pageNo != prevPage) {
             pi = e->GetFzPageInfo(a.pageNo, true);
@@ -1843,13 +2413,16 @@ void SidecarMaybeImport(EngineBase* engine) {
         logf("sidecar: no supported annotations in '%s'\n", use.path);
         return;
     }
+    // stamp / attachment payloads live in assets/ next to the JSON; load
+    // them (entries whose file is missing are skipped by the import)
+    LoadSidecarAssetBuffers(ctx, use.path, entries);
     // suppress the auto-save arming that MarkNotificationAsModified would
     // do during import (import may also run off the UI thread)
     gSidecarImporting = true;
     int n = ImportSidecarEntries(e, entries);
     gSidecarImporting = false;
     for (SidecarAnnot& sa : entries) {
-        FreeSidecarAnnotStrings(sa);
+        FreeSidecarAnnotStrings(ctx, sa);
     }
     if (n > 0) {
         logf("sidecar: imported %d annotations from '%s' (%s)\n", n, use.path,
@@ -1894,9 +2467,14 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
     Vec<Annotation*> annots;
     EngineMupdfGetAnnotations(engine, annots);
     int nSkippedUnsupported = 0;
-    Str json = BuildSidecarJson(e, annots, pdfPath, nSkippedUnsupported);
+    Vec<SidecarAnnot> entries;
+    Str json = BuildSidecarJson(e, annots, pdfPath, nSkippedUnsupported, entries);
     if (len(json) == 0) {
         ShowWarningNotification(win->hwndCanvas, StrL("Failed to build JSON sidecar"), 5000);
+        fz_context* ctx = e->Ctx();
+        for (SidecarAnnot& sa : entries) {
+            FreeSidecarAnnotStrings(ctx, sa);
+        }
         return SidecarResult::Failed;
     }
 
@@ -1912,20 +2490,42 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
                                 fmt(Tr("Failed to save '%s': %s").s, tgt.path, StrL("cannot write file")), 5000);
         logf("sidecar: failed to write '%s'\n", tgt.path);
         str::Free(json);
+        fz_context* ctx = e->Ctx();
+        for (SidecarAnnot& sa : entries) {
+            FreeSidecarAnnotStrings(ctx, sa);
+        }
         return SidecarResult::Failed;
     }
     str::Free(json);
 
+    // write the payload files (stamp images / attachment contents) into
+    // assets/ next to the JSON, then remove asset files that no sidecar
+    // in the folder references anymore
+    {
+        fz_context* ctx = e->Ctx();
+        int nAssetFailed = WriteSidecarAssets(tgt.path, entries);
+        for (SidecarAnnot& sa : entries) {
+            FreeSidecarAnnotStrings(ctx, sa);
+        }
+        if (nAssetFailed > 0) {
+            // the JSON references the missing files; the annotations stay
+            // in the PDF until it is saved, so nothing is lost yet
+            ShowWarningNotification(
+                win->hwndCanvas, fmt("Saved '%s', but %d asset file(s) failed to write", tgt.path, nAssetFailed), 5000);
+        }
+        CleanupSidecarAssets(tgt.path);
+    }
+
     e->modifiedAnnotations = false;
     ToolbarUpdateStateForWindow(win, true);
     if (nSkippedUnsupported > 0) {
-        // make it visible that some annotations (stamp / file attachment)
-        // cannot live in the JSON sidecar and will be lost on reopen
-        ShowPlainNotification(
-            win->hwndCanvas,
-            fmt("Saved annotations to '%s' (%d skipped: unsupported types, not in sidecar)", tgt.path,
-                nSkippedUnsupported),
-            5000);
+        // make it visible that some annotations (unsupported types or
+        // unreadable payloads) are not in the sidecar and will be lost on
+        // reopen
+        ShowPlainNotification(win->hwndCanvas,
+                              fmt("Saved annotations to '%s' (%d skipped: unsupported or unreadable annotations)",
+                                  tgt.path, nSkippedUnsupported),
+                              5000);
     } else {
         ShowPlainNotification(win->hwndCanvas, fmt(Tr("Saved annotations to '%s'").s, tgt.path), 5000);
     }

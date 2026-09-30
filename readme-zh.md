@@ -8,11 +8,13 @@ PDF 批注的 Sidecar（边车文件）是指批注数据不写进 PDF 本体，
 
 ## 为什么
 
-我的 PDF 书库里有几百兆的单文件扫描件，放在 OneDrive 上同步。SumatraPDF 的批注功能一旦启用，每次画条线都改写整个 PDF——600MB 的文件，改一个字节，OneDrive 就得整个重传。关掉批注功能，等于放弃阅读器一半的价值。
+> **SumatraPDF** 原本支持将注释存为同名 `.smx` 纯文本文件，最后支持版本为 **3.2**；
+> **Okular** 早期将注释存为隐藏的 XML 文件，最后支持版本为 **1.2**。
+> 两家在 2018 年前后主动砍掉该功能且明确表示不会恢复。放弃的核心原因有三：文件重命名或另存后 sidecar 容易失联，引发“数据丢失”错觉；纯文本格式无法承载复杂注释类型；跨格式坐标单位不统一导致维护成本高。最终标准 PDF 内嵌注释的成熟，使这条独立存储路线彻底退出历史舞台。
 
-官方代码里其实有 sidecar 机制（EPUB 用的），PDF 路线的实现在几年前被移除了。这个仓库按 PDF 的方式重新做了一遍，存 JSON 而不是 XFDF。
+行业共识是批注理应跟着文件走，但对某些场景，这恰恰是灾难：我的 PDF 书库里有几百兆的单文件扫描件，放在 OneDrive 上同步。SumatraPDF 的批注功能一旦启用，每次画条线都改写整个 PDF——600MB 的文件，改一个字节，OneDrive 就得整个重传；关掉批注，等于放弃阅读器一半的价值。
 
-结果：打开带批注的 PDF，PDF 文件本身的修改时间是零。所有批注数据在旁边的 `.json` 文件里。
+因此我喜欢sidecar：打开带批注的 PDF，PDF 文件本身的修改时间是零。所有批注数据在旁边的 `.json` 文件里。
 
 ## 工作方式
 
@@ -38,15 +40,16 @@ Annotations [
 
 ## 支持的批注类型
 
-14 种，属性完整往返：
+16 种，属性完整往返：
 
-Text（便签）、FreeText（文本框）、Highlight、Underline、Squiggly、StrikeOut、Line、Square、Circle、Polygon、PolyLine、Ink、Caret、Redact
+Text（便签）、FreeText（文本框）、Highlight、Underline、Squiggly、StrikeOut、Line、Square、Circle、Polygon、PolyLine、Ink、Caret、Redact、Stamp（图章）、FileAttachment（附件）
 
 FreeText 支持字体、字号、文字颜色、对齐方式、加粗、斜体、下划线、透明背景。所有类型的颜色（含无色/透明）、透明度、边框、作者、时间戳都会保留。
 
+图章和附件带有二进制载荷（图片、嵌入文件），JSON 不放二进制：载荷写入 JSON 旁边的 `assets/` 目录，按内容哈希命名（`assets/<hash>.<ext>`）并以相对路径引用。相同内容自动去重，保存时会清理不再被任何 sidecar 引用的资产文件。旧格式（无 asset 字段）的 sidecar 仍可正常导入。
+
 ## 已知限制
 
-- **图章（Stamp）和附件（FileAttachment）不支持。** 它们的数据是嵌入的图片和文件，JSON 里不放二进制。保存时这两类批注会被跳过并计数，状态栏会提示跳过了几条。
 - **没有冲突合并。** 两台机器同时改同一个 sidecar，后保存的覆盖先保存的。单人使用没问题。
 - 大批注有防御性上限：多边形/折线 512 个顶点，墨迹 64 笔、每笔最多 2048 个点。超出的部分截断。
 - 别的阅读器打开这个 PDF 看不到批注——数据在 JSON 里，不在 PDF 里。这是设计使然。
