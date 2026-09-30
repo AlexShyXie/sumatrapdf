@@ -30,6 +30,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $ver = $env:TAG.TrimStart("v")
-          $asset = "SumatraPDF-$ver-sidecar.exe"
+          $asset = "SumatraPDF-$ver.exe"
           Copy-Item out\rel64\SumatraPDF-static.exe $asset
           gh release create $env:TAG $asset --title "SumatraPDF $env:TAG" --generate-notes
