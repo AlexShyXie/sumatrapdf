@@ -2341,6 +2341,9 @@ static void UpdateUiForCurrentTab(MainWindow* win) {
 }
 
 static bool showTocByDefault(Str path, EngineBase* engine) {
+    if (gSettings->alwaysShowSidebar) {
+        return true;
+    }
     if (!gSettings->showToc) {
         return false;
     }
@@ -2529,7 +2532,7 @@ static void ReplaceDocumentInCurrentTab(LoadArgs* args, DocController* ctrl, Fil
         } else if (fs->windowState == WIN_STATE_MINIMIZED) {
             showType = SW_MINIMIZE;
         }
-        showToc = fs->showToc;
+        showToc = fs->showToc || gSettings->alwaysShowSidebar;
         if (win->ctrl && win->presentation) {
             showToc = tab->showTocPresentation;
         }
@@ -2990,6 +2993,7 @@ void ReloadDocument(MainWindow* win, bool autoRefresh, bool canAskForPassword) {
         return;
     }
     logf("ReloadDocument: %s, auto refresh: %d\n", path, (int)autoRefresh);
+    auto timeStart = TimeGet();
 
     // Save display state before potentially destroying the old controller
     FileState* fs = NewFileState(path);
@@ -3070,6 +3074,8 @@ void ReloadDocument(MainWindow* win, bool autoRefresh, bool canAskForPassword) {
         }
     }
 
+    // reopening reads the file again: slow on a network / cloud drive
+    logf("ReloadDocument: %s reloaded in %.1f ms\n", path, TimeSinceInMs(timeStart));
     DeleteFileState(fs);
 }
 
@@ -6232,6 +6238,12 @@ static bool AppendFileFilterForDoc(DocController* ctrl, str::Builder& fileFilter
     auto ext = ctrl->GetDefaultFileExt();
     if (str::EqI(ext, StrL(".xps"))) {
         fileFilter.Append(Tr("XPS documents"));
+    } else if (str::EqI(ext, StrL(".docx"))) {
+        fileFilter.Append(Tr("Word documents"));
+    } else if (str::EqI(ext, StrL(".xlsx"))) {
+        fileFilter.Append(Tr("Excel workbooks"));
+    } else if (str::EqI(ext, StrL(".pptx"))) {
+        fileFilter.Append(Tr("PowerPoint presentations"));
     } else if (str::EqI(ext, StrL(".epub"))) { // NOLINT(bugprone-branch-clone): see kindEngineEpub below
         // .epub can be handled by kindEngineMupdf
         fileFilter.Append(Tr("EPUB ebooks"));
@@ -9607,15 +9619,16 @@ static void OnFrameKeyEsc(MainWindow* win) {
         ToolbarUpdateStateForWindow(win, false);
         return;
     }
+    // leave presentation / fullscreen before EscToExit quits (issue #6250)
+    if (win->presentation || win->isFullScreen) {
+        ToggleFullScreen(win, win->presentation != PM_DISABLED);
+        return;
+    }
     // Esc is the cancel key while the Edit PDF toolbar is up ("Place text
     // annotation. Esc to cancel"), so it must not also quit: the press after a
     // cancelled placement was closing the document (issue #6118).
     if (!win->pdfAnnotationsToolbarEnabled && gSettings->escToExit && CanCloseWindow(win)) {
         CloseWindow(win, true, false);
-        return;
-    }
-    if (win->presentation || win->isFullScreen) {
-        ToggleFullScreen(win, win->presentation != PM_DISABLED);
         return;
     }
     if (gPluginMode) {
@@ -13778,6 +13791,34 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             lastCreatedAnnot = EngineMupdfCreateAnnotation(engine, pageNoUnderCursor, ptOnPage, &args);
         } break;
 
+        case CmdInsertTextSnippet: {
+            // a free text box with the snippet's text, at the context menu
+            // point (lp) or else the cursor
+            if (!win || !tab || !dm || !cmd) {
+                return 0;
+            }
+            EngineBase* engine = dm->GetEngine();
+            if (!engine || !EngineSupportsAnnotations(engine)) {
+                return 0;
+            }
+            Point pt = HwndGetCursorPos(win->hwndCanvas);
+            if (lp != 0) {
+                pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            }
+            int pageNo = dm->GetPageNoByPoint(pt);
+            if (pageNo < 0 && !SetPointToVisiblePage(dm, pt, pageNo)) {
+                return 0;
+            }
+            PointF ptOnPage = dm->CvtFromScreen(pt, pageNo);
+            AnnotCreateArgs args{AnnotationType::FreeText};
+            SetAnnotCreateArgs(args, cmd);
+            args.content = GetCommandStringArg(cmd, kCmdArgText, {});
+            SizeF sz = FreeTextPlacementPageSize(args);
+            args.hasRect = true;
+            args.rect = {ptOnPage.x, ptOnPage.y, sz.dx, sz.dy};
+            lastCreatedAnnot = EngineMupdfCreateAnnotation(engine, pageNo, ptOnPage, &args);
+        } break;
+
         case CmdCreateAnnotImageFromClipboard: {
             Pixmap* image = GetClipboardImageAsPixmap();
             if (!image) {
@@ -13792,6 +13833,7 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             FreePixmap(image);
         } break;
 
+        case CmdSignWithImage:
         case CmdInsertImage: {
             // File / document menu: pick a PNG (or other image) and stamp it on
             // the page — the Fill & Sign-style electronic signature (#1744).
@@ -13802,7 +13844,15 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             if (!engine || !EngineSupportsAnnotations(engine)) {
                 return 0;
             }
-            TempStr path = PickImageFilePathTemp(win->hwndFrame);
+            // Sign With Image stamps Annotations.SignatureImage without asking
+            TempStr path{};
+            Str sigPath = gSettings->annotations.signatureImage;
+            if (cmdId == CmdSignWithImage && len(sigPath) > 0 && file::Exists(sigPath)) {
+                path = str::DupTemp(sigPath);
+            }
+            if (len(path) == 0) {
+                path = PickImageFilePathTemp(win->hwndFrame);
+            }
             if (len(path) == 0) {
                 return 0;
             }
@@ -16276,6 +16326,16 @@ static bool MaybeTranslateAccelerator(MSG& msg) {
         }
     }
 
+    // arrows nudge a selected annotation instead of scrolling. Only for the
+    // canvas / frame: the in-place text editor keeps its caret keys
+    if (msg.message == WM_KEYDOWN && !IsCtrlPressed() && !IsAltPressed()) {
+        MainWindow* win = FindMainWindowByHwnd(msg.hwnd);
+        bool isFrameOrCanvas = win && (msg.hwnd == win->hwndFrame || msg.hwnd == win->hwndCanvas);
+        if (isFrameOrCanvas && NudgeSelectedAnnotation(win, msg.wParam)) {
+            return true;
+        }
+    }
+
     // Shift+arrows normally accelerate to scroll. When a PDF text selection is
     // active, skip the accelerator so FrameOnKeydown can extend the selection
     // via TextSelection::ExtendBy (issue #5814).
@@ -16976,7 +17036,7 @@ Learn more at https://www.sumatrapdfreader.org/docs/Corrupted-installation
 
 static Str kInstallerHelpTmpl() {
     return StrL(R"(${appName} installer options:
-[-s] [-d <path>] [-with-filter] [-with-preview] [-x]
+[-s] [-d <path>] [-with-filter] [-with-preview] [-no-desktop-shortcut] [-x]
 
 -s
     installs ${appName} silently (without user interaction)
@@ -16986,6 +17046,8 @@ static Str kInstallerHelpTmpl() {
     install search filter
 -with-preview
     install shell preview
+-no-desktop-shortcut
+    don't create a desktop shortcut
 -x
     extracts the files, doesn't install
 -log
@@ -18069,9 +18131,9 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     if (ExeHasNameOfStoreInstaller()) {
         InstallSumatraCrashHandler(false);
         logf("Running store installer\n");
-        flags.install = true;
+        flags.installer.install = true;
         flags.silent = true;
-        flags.storeInstaller = true;
+        flags.installer.storeInstaller = true;
         gCli = &flags;
         int ret = RunInstaller();
         uitask::Destroy();
@@ -18126,11 +18188,12 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
         }
     }
 
-    bool isInstaller = flags.install || flags.runInstallNow || flags.fastInstall || IsInstallerAndNamedAsSuch();
-    if (flags.justExtractFiles) {
+    bool isInstaller = flags.installer.install || flags.installer.runInstallNow || flags.installer.fastInstall ||
+                       IsInstallerAndNamedAsSuch();
+    if (flags.installer.justExtractFiles) {
         isInstaller = false;
     }
-    bool isUninstaller = flags.uninstall;
+    bool isUninstaller = flags.installer.uninstall;
     bool noLogHere = isInstaller || isUninstaller;
 
     if (gCli->silent) {
@@ -18179,7 +18242,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     }
 #endif
 
-    if (flags.showHelp && IsInstallerButNotInstalled()) {
+    if (flags.installer.showHelp && IsInstallerButNotInstalled()) {
         ShowInstallerHelp();
         HandleRedirectedConsoleOnShutdown();
         return 0;
@@ -18279,7 +18342,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
     // ParseFlags skips flag parsing when argv[1] is a mutool name (poster, …),
     // so poster’s own -x never sets justExtractFiles; MaybeRunMutool still runs
     // for tools after we load the DLL below.
-    if (flags.justExtractFiles) {
+    if (flags.installer.justExtractFiles) {
         bool attached = RedirectIOToExistingConsole();
         auto printExtractErr = [attached](Str msg) {
             logf("%s\n", msg);
@@ -18294,7 +18357,7 @@ int APIENTRY WinMain(_In_ HINSTANCE /*hInstance*/, _In_opt_ HINSTANCE /*hPrevIns
             return 1;
         }
         exitCode = 0;
-        if (!ExtractInstallerFiles(gCli->installDir)) {
+        if (!ExtractInstallerFiles(gCli->installer.installDir)) {
             Str err = gFirstError ? gFirstError : StrL("failed to extract files");
             printExtractErr(err);
             LogLastError();

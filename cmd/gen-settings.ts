@@ -745,6 +745,12 @@ const externalViewer: Field[] = [
   ).ver("3.7"),
 ];
 
+const textSnippet: Field[] = [
+  field("Name", Str, null, "name shown in the context menu and the command palette"),
+  field("Text", Str, null, "text of the free text annotation it inserts; \\n starts a new line"),
+  field("Key", Str, null, "keyboard shortcut"),
+];
+
 const selectionHandler: Field[] = [
   field(
     "URL",
@@ -961,6 +967,13 @@ const annotations: Field[] = [
     "central folder for JSON annotation files, used when no such file exists next to the PDF: the file is looked up " +
       "in <CentralFolder>/<pdf parent folder name>/<pdf name>.json",
   ),
+  field(
+    "SignatureImage",
+    Str,
+    null,
+    "image (e.g. a transparent .png of your signature) that Sign With Image stamps on the page. " +
+      "If not set, or the file is missing, Sign With Image asks for an image",
+  ).ver("3.7"),
 ];
 
 const favorite: Field[] = [
@@ -1282,7 +1295,12 @@ const globalPrefs: Field[] = [
     "if true, show the SyncTeX inverse search command line in Settings -> Options, so a " +
       "double-click in the document can jump to the matching line in a LaTeX editor",
   ),
-  field("EscToExit", Bool, false, "if true, Esc key closes SumatraPDF"),
+  field(
+    "EscToExit",
+    Bool,
+    false,
+    "if true, Esc key closes SumatraPDF. In presentation or fullscreen mode, Esc leaves that mode first",
+  ),
   field("FullPathInTitle", Bool, false, "if true, show the full path to the document in the title bar").ver("3.0"),
   field("InverseSearchCmdLine", Str, null, "pattern used to launch the LaTeX editor when doing inverse search"),
   field(
@@ -1441,6 +1459,13 @@ const globalPrefs: Field[] = [
       "(or page label); if false (the default), they are sorted by page number",
   ).ver("3.7"),
   field("ShowToc", Bool, true, "if true, show the table of contents (Bookmarks) sidebar when the document has one"),
+  field(
+    "AlwaysShowSidebar",
+    Bool,
+    false,
+    "if true, every document with bookmarks opens with the Bookmarks sidebar, " +
+      "even one that was closed with it hidden",
+  ).ver("3.7"),
   field(
     "SidebarOnRight",
     Bool,
@@ -1912,6 +1937,12 @@ const globalPrefs: Field[] = [
     "list of handlers for selected text, shown in context menu when text selection is active. See [docs for more information](https://www.sumatrapdfreader.org/docs/Customize-search-translation-services)",
   ),
   emptyLine(),
+  array(
+    "TextSnippets",
+    textSnippet,
+    "predefined text inserted as a free text annotation from the context menu or the command palette",
+  ).ver("3.7"),
+  emptyLine(),
   array("Shortcuts", keyboardShortcut, "custom keyboard shortcuts"),
   emptyLine(),
   array("Themes", theme, "color themes").ver("3.6"),
@@ -2101,6 +2132,7 @@ const globalPrefsLayout = [
   "ShowFavorites",
   "SortFavoritesByName",
   "ShowToc",
+  "AlwaysShowSidebar",
   "SidebarOnRight",
   "SidebarWindowSize",
   "ShowLinks",
@@ -2199,7 +2231,7 @@ function cdefault(f: Field, built: Record<string, number>): string {
     if (f.Default === null || f.Default === undefined) {
       return "0";
     }
-    return `(intptr_t)"${f.Default}"`;
+    return `(intptr_t)"${escapeCStr(f.Default)}"`;
   }
   const typeName = f.Type.name;
   if (["Struct", "StructPtr", "Array", "Compact"].includes(typeName)) {
