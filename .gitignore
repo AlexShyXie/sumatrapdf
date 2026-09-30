@@ -44,3 +44,4 @@ tests/tmp/
 /scratch.txt
 .codebuddy/
 sidecar_log/
+sidecar-v*.patch

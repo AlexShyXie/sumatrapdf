@@ -1648,6 +1648,53 @@ static pdf_annot* CreateAnnotFromEntry(fz_context* ctx, pdf_page* page, const Si
             if (a.quadding >= 0) {
                 pdf_set_annot_quadding(ctx, pa, a.quadding);
             }
+            // rich text style (/DS): MUST be written after the /DA block
+            // above - pdf_set_annot_default_appearance() deletes /DS as
+            // "not supported" (pdf-annot.c). This is also why the
+            // sidebar's SetFreeTextFont() cannot be used from the import
+            // loop: it is guarded by AnnotationIsLive(), which requires
+            // the annotation to already be in the engine's page list, and
+            // the wrapper is only registered by MarkNotificationAsModified
+            // (Add) after this loop - the write has to happen right here
+            // at the mupdf level, mirroring WriteFreeTextFontLocked.
+            if (len(a.fontFamily) > 0 || a.fontStyle != 0) {
+                const char* daFont = nullptr;
+                float daSize = 0;
+                int nCol = 0;
+                float daColor[4]{};
+                pdf_annot_default_appearance(ctx, pa, &daFont, &daSize, &nCol, daColor);
+                int r = 0, g = 0, b = 0;
+                if (nCol >= 3) {
+                    r = (int)(daColor[0] * 255.0f + 0.5f);
+                    g = (int)(daColor[1] * 255.0f + 0.5f);
+                    b = (int)(daColor[2] * 255.0f + 0.5f);
+                } else if (nCol == 1) {
+                    r = g = b = (int)(daColor[0] * 255.0f + 0.5f);
+                }
+                if (daSize <= 0) {
+                    daSize = 12;
+                }
+                int q = (a.quadding >= 0 && a.quadding <= 2) ? a.quadding : 0;
+                Str align = (q == 1) ? StrL("center") : (q == 2) ? StrL("right") : StrL("left");
+                TempStr cssFam = str::DupTemp(a.fontFamily);
+                if (len(cssFam) == 0) {
+                    cssFam = str::DupTemp(StrL("Helvetica"));
+                }
+                cssFam.len -= str::RemoveCharsInPlace(cssFam, StrL("'\";{}"));
+                str::Builder ds;
+                ds.Append(fmt("font-family:'%s';font-size:%gpt;color:#%02x%02x%02x;text-align:%s", cssFam, daSize, r, g,
+                              b, align));
+                if (a.fontStyle & kFreeTextBold) {
+                    ds.Append(StrL(";font-weight:bold"));
+                }
+                if (a.fontStyle & kFreeTextItalic) {
+                    ds.Append(StrL(";font-style:italic"));
+                }
+                if (a.fontStyle & kFreeTextUnderline) {
+                    ds.Append(StrL(";text-decoration:underline"));
+                }
+                pdf_set_annot_rich_defaults(ctx, pa, CStrTemp(ToStrTemp(ds)));
+            }
         }
         if (a.borderWidth > 0 && AnnotationSupportsBorder(a.type)) {
             pdf_set_annot_border_width(ctx, pa, (float)a.borderWidth);
@@ -1715,21 +1762,12 @@ static int ImportSidecarEntries(EngineMupdf* e, const Vec<SidecarAnnot>& entries
             pdf_drop_annot(ctx, pa);
             continue;
         }
-        // FreeText styling: /DS must be written AFTER the /DA block in
-        // CreateAnnotFromEntry, because pdf_set_annot_default_appearance
-        // deletes /DS (and /RC) as "not supported" (pdf-annot.c). The /DS
-        // is what the appearance synthesizer renders the text with when
-        // the HTML engine is enabled (font family / bold / italic /
-        // underline); without it the text falls back to /DA's base font.
-        if (a.type == AnnotationType::FreeText && (len(a.fontFamily) > 0 || a.fontStyle != 0)) {
-            // SetFreeTextFont() ignores an empty family: fall back to the
-            // base font name the way the sidebar does
-            Str fam = a.fontFamily;
-            if (len(fam) == 0) {
-                fam = StrL("Helvetica");
-            }
-            SetFreeTextFont(wa, fam, a.fontStyle);
-        }
+        // (FreeText styling is written inside CreateAnnotFromEntry at the
+        // mupdf level - NOT here via SetFreeTextFont(): that helper is
+        // guarded by AnnotationIsLive(), which is false until
+        // MarkNotificationAsModified(Add) below registers this wrapper in
+        // the engine's page list, so calling it here was a silent no-op and
+        // the /DS never landed. Fixed by writing /DS directly.)
         // the engine's own bookkeeping: appends to pageInfo->annotations and
         // rebuilds the page comments, exactly like a user-created annotation
         MarkNotificationAsModified(e, wa, AnnotationChange::Add);
