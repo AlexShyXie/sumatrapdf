@@ -6,7 +6,7 @@ import { clearDirPreserveSettings } from "./clean";
 import { ensureNinja, ninjaDir, ninjaToRoot } from "./ninja";
 import { detectVisualStudio2026, runLogged } from "./util";
 
-type BuildMode = "windows" | "all" | "smoke" | "ci" | "daily" | "codeql" | "mingw" | "wine" | "build-no";
+type BuildMode = "windows" | "all" | "smoke" | "ci" | "daily" | "codeql" | "static" | "mingw" | "wine" | "build-no";
 type Config = "debug" | "release" | "profile";
 
 interface BuildOptions {
@@ -34,6 +34,7 @@ Windows builds:
   -ci                     Build CI/pre-release artifacts
   -daily                  Build daily artifacts
   -codeql                 Build the static release target for CodeQL
+  -static                 Build the static release exe (out/rel64)
 
 MinGW cross-builds (they still produce a Windows exe):
   -mingw <-dbg|-rel> [-clean]
@@ -127,6 +128,7 @@ function parseArgs(args: string[]): BuildOptions | undefined {
     else if (arg === "-ci") setMode(opts, "ci");
     else if (arg === "-daily") setMode(opts, "daily");
     else if (arg === "-codeql") setMode(opts, "codeql");
+    else if (arg === "-static") setMode(opts, "static");
     else if (arg === "-mingw") setMode(opts, "mingw");
     else if (arg === "-wine" || arg === "-win") setMode(opts, "wine");
     else if (arg === "-run") {
@@ -158,7 +160,7 @@ function reject(condition: boolean, message: string): void {
 
 function validateOptions(opts: BuildOptions): void {
   const mode = opts.mode!;
-  const fixedModes: BuildMode[] = ["all", "smoke", "ci", "daily", "codeql", "wine", "build-no"];
+  const fixedModes: BuildMode[] = ["all", "smoke", "ci", "daily", "codeql", "static", "wine", "build-no"];
   if (fixedModes.includes(mode)) {
     reject(!!opts.config, `${opts.config ? configFlag(opts.config) : ""} is not valid with -${mode}`);
     reject(opts.asan, `-asan is not valid with -${mode}`);
@@ -407,6 +409,9 @@ async function runBuild(opts: BuildOptions): Promise<void> {
   } else if (mode === "codeql") {
     const { buildCodeql } = await import("./helper/codeql-build");
     await buildCodeql();
+  } else if (mode === "static") {
+    const { buildStatic } = await import("./helper/static-build");
+    await buildStatic();
   } else if (mode === "mingw") {
     const { buildMingw } = await import("./helper/mingw-build");
     await buildMingw({
