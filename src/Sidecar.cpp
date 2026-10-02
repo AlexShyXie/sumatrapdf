@@ -2209,6 +2209,26 @@ static void AppendMdJsonCompact(str::Builder& b, const fz_json* v) {
 // the "> key: value" body of a callout for one annotation. Fields come
 // from SerializeAnnotJson via a JSON round-trip so the two formats can
 // never drift apart: one place (the JSON serializer) defines them.
+//
+// MD-only nicety: the contents line is ALWAYS present so the file can be
+// annotated by hand in Obsidian. When the PDF annotation has no note the
+// line is filled from the markup's text (the highlighted words); when
+// there is no text either it is left empty. The value flows back on the
+// next import (empty never sets anything on the PDF side).
+static void AppendMdContentsLine(str::Builder& b, Str fill, Str eol) {
+    b.Append(StrL("> contents: "));
+    if (len(fill) > 0) {
+        if (MdIsPlainScalar(fill)) {
+            b.Append(fill);
+        } else {
+            AppendMdJsonString(b, fill);
+        }
+    } else {
+        b.Append(StrL("\"\"")); // explicit empty: ready for a hand-written note
+    }
+    b.Append(eol);
+}
+
 static void AppendAnnotMdLines(str::Builder& b, fz_context* ctx, const SidecarAnnot& sa, bool crlf) {
     str::Builder jb;
     SerializeAnnotJson(jb, sa);
@@ -2218,7 +2238,32 @@ static void AppendAnnotMdLines(str::Builder& b, fz_context* ctx, const SidecarAn
     fz_try(ctx) {
         fz_json* o = fz_parse_json(ctx, pool, CStrTemp(js));
         if (o && o->type == FZ_JSON_OBJECT) {
+            // pass 1: does a non-empty contents exist, and what is text?
+            bool hasContents = false;
+            Str textFill; // view into the DOM; the pool outlives this loop
             for (const fz_json_object* kv = o->u.object; kv; kv = kv->next) {
+                if (kv->value->type == FZ_JSON_STRING) {
+                    Str key = Str(kv->key);
+                    Str val = Str(kv->value->u.string);
+                    if (str::Eq(key, StrL("contents")) && len(val) > 0) {
+                        hasContents = true;
+                    } else if (str::Eq(key, StrL("text")) && len(val) > 0) {
+                        textFill = val;
+                    }
+                }
+            }
+            // pass 2: emit; the contents fill goes where the JSON would
+            // have it (right before the dates, which follow text/contents
+            // in SerializeAnnotJson's field order), or after the last field
+            bool contentsEmitted = hasContents;
+            for (const fz_json_object* kv = o->u.object; kv; kv = kv->next) {
+                if (!contentsEmitted) {
+                    Str key = Str(kv->key);
+                    if (str::Eq(key, StrL("creationDate")) || str::Eq(key, StrL("modDate"))) {
+                        AppendMdContentsLine(b, textFill, eol);
+                        contentsEmitted = true;
+                    }
+                }
                 b.Append(StrL("> "));
                 b.Append(Str(kv->key));
                 b.Append(StrL(": "));
@@ -2228,6 +2273,9 @@ static void AppendAnnotMdLines(str::Builder& b, fz_context* ctx, const SidecarAn
                     AppendMdJsonCompact(b, kv->value);
                 }
                 b.Append(eol);
+            }
+            if (!contentsEmitted) {
+                AppendMdContentsLine(b, textFill, eol);
             }
         }
     }
