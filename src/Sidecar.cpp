@@ -94,6 +94,8 @@
 #include "base/Win.h"
 
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 extern "C" {
@@ -123,6 +125,12 @@ extern "C" {
 
 bool SidecarSeparateSaveEnabled() {
     return gSettings && gSettings->annotations.separateSave;
+}
+
+// md mode: sidecar files are Markdown (.md) instead of JSON. The format
+// implementation lives in the "Markdown sidecar" section below.
+static bool SidecarMdEnabled() {
+    return gSettings && gSettings->annotations.separateSaveAsMd;
 }
 
 bool SidecarWantsRedirect(EngineBase* engine) {
@@ -155,8 +163,8 @@ static char PathSepFor(Str dir) {
     return '\\';
 }
 
-// "D:\books\report.pdf" -> "D:\books\report.json"
-static SidecarTarget ResolveSiblingTarget(Str pdfPath) {
+// "D:\books\report.pdf" -> "D:\books\report.json" (or .md in md mode)
+static SidecarTarget ResolveSiblingTargetExt(Str pdfPath, const char* ext) {
     SidecarTarget res;
     TempStr dir = path::GetDirTemp(pdfPath);
     TempStr base = path::GetBaseNameTemp(pdfPath);
@@ -172,15 +180,15 @@ static SidecarTarget ResolveSiblingTarget(Str pdfPath) {
     char sep = PathSepFor(Str(dir));
     b.AppendChar(sep);
     b.Append(name);
-    b.Append(StrL(".json"));
+    b.Append(Str(ext));
     res.path = b.TakeStr();
     res.central = false;
     res.exists = file::Exists(res.path);
     return res;
 }
 
-// "D:\books\sub\report.pdf" + "D:\notes" -> "D:\notes\sub\report.json"
-static SidecarTarget ResolveCentralTarget(Str pdfPath) {
+// "D:\books\sub\report.pdf" + "D:\notes" -> "D:\notes\sub\report.json" (or .md)
+static SidecarTarget ResolveCentralTargetExt(Str pdfPath, const char* ext) {
     SidecarTarget res;
     Str folder = gSettings->annotations.centralFolder;
     if (len(folder) == 0) {
@@ -220,11 +228,19 @@ static SidecarTarget ResolveCentralTarget(Str pdfPath) {
     b.Append(parentName);
     b.AppendChar(sep);
     b.Append(name);
-    b.Append(StrL(".json"));
+    b.Append(Str(ext));
     res.path = b.TakeStr();
     res.central = true;
     res.exists = file::Exists(res.path);
     return res;
+}
+
+static SidecarTarget ResolveSiblingTarget(Str pdfPath) {
+    return ResolveSiblingTargetExt(pdfPath, SidecarMdEnabled() ? ".md" : ".json");
+}
+
+static SidecarTarget ResolveCentralTarget(Str pdfPath) {
+    return ResolveCentralTargetExt(pdfPath, SidecarMdEnabled() ? ".md" : ".json");
 }
 
 // order of preference: existing sibling wins, then existing central
@@ -933,7 +949,10 @@ static void CleanupSidecarAssets(Str jsonPath) {
     }
     Vec<Str> jsons; // owned
     for (DirIterEntry* de : DirIter(jdir)) {
-        if (!de->isFile || !str::EndsWithI(de->name, StrL(".json"))) {
+        // md sidecars reference their assets the same way (in callout kv
+        // lines), so both suffixes must be scanned or a still-referenced
+        // payload would be deleted
+        if (!de->isFile || !(str::EndsWithI(de->name, StrL(".json")) || str::EndsWithI(de->name, StrL(".md")))) {
             continue;
         }
         Str data = file::ReadFile(de->filePath);
@@ -1589,8 +1608,9 @@ static Str DocTitle(EngineMupdf* e) {
 
 static constexpr int kSidecarVersion = 2;
 
-static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str pdfPath, int& nSkippedUnsupported,
-                            Vec<SidecarAnnot>& entries) {
+// collect the live annotations; shared by the JSON and the Markdown writer
+static void CollectSidecarEntries(EngineMupdf* e, const Vec<Annotation*>& annots, int& nSkippedUnsupported,
+                                  Vec<SidecarAnnot>& entries) {
     nSkippedUnsupported = 0;
     StextCache cache;
     cache.e = e;
@@ -1619,7 +1639,10 @@ static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str 
         nWritten++;
     }
     StextCacheReset(cache);
+    logf("sidecar: exported %d annotations\n", nWritten);
+}
 
+static Str BuildSidecarJson(EngineMupdf* e, Str pdfPath, const Vec<SidecarAnnot>& entries) {
     str::Builder b;
     b.Append(fmt("{\n  \"version\": %d,\n  \"generator\": \"SumatraPDF-sidecar/2\",\n", kSidecarVersion));
     TempStr base = path::GetBaseNameTemp(pdfPath);
@@ -1649,9 +1672,6 @@ static Str BuildSidecarJson(EngineMupdf* e, const Vec<Annotation*>& annots, Str 
         b.AppendChar('\n');
     }
     b.Append(StrL("  ]\n}\n"));
-    logf("sidecar: exported %d annotations\n", nWritten);
-    // entries (including their payload buffers) move to the caller, which
-    // writes the asset files and then releases them
     return b.TakeStr();
 }
 
@@ -2003,6 +2023,776 @@ static bool ParseSidecarJson(fz_context* ctx, char* data, Vec<SidecarAnnot>& out
         fz_report_error(ctx);
     }
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Markdown sidecar (Annotations->SeparateSaveAsMd = true)
+//
+// The same data as the JSON sidecar, stored as Markdown so it can live in
+// an Obsidian vault: annotations become Obsidian-style callouts, everything
+// else in the file belongs to the user. Structure:
+//
+//   ---                       front matter (created once, then verbatim)
+//   sumatrapdf_sidecar: 2
+//   generator: SumatraPDF-sidecar/2-md
+//   file: report.pdf
+//   ---
+//   # user content ...        anything; preserved verbatim on save
+//
+//   > [!Note] optional title  one callout per annotation
+//   > type: highlight         body lines "key: value" with a known key
+//   > page: 11                are machine-owned, rewritten on save
+//   > rect: [58.4,695.2,299.6,708.4]
+//
+// Semantics (the executable spec is md_sidecar_ref.py / test_md_sidecar.py):
+// - a callout is a maximal run of '>' lines whose first starts with "> [!";
+//   body lines matching key ':' with a known key are machine kv lines,
+//   every other body line is user text kept verbatim
+// - values are plain scalars (unquoted) or JSON literals (numbers,
+//   "escaped strings", [arrays], {objects}); MdIsPlainScalar decides
+// - import prefers .md and falls back to .json (read-only; the next manual
+//   save writes the .md - automatic migration; the .json is never touched)
+// - save merges: matched callouts are rewritten in place (engine data
+//   wins over edits made to kv values in the editor), callouts of deleted
+//   annotations are dropped, new annotations are appended at the end;
+//   deleting a callout takes effect at the next document open (the reopen
+//   is the sync point - it is the import that creates the annotations)
+// - callouts are matched to live annotations by /NM first, then by
+//   type+page+rect proximity
+// - the write goes through a temp file + MoveFileExW so a crash mid-save
+//   can never destroy the user's notes
+
+// the keys SerializeAnnotJson emits; anything else in a callout body is
+// user text
+static const char* kMdKnownKeys[] = {
+    "type",     "page",       "rect",     "quads",      "start",       "end",
+    "vertices", "inkList",    "color",    "interiorColor", "opacity",  "borderWidth",
+    "lineStart", "lineEnd",   "icon",     "asset",      "attachment",  "isOpen",
+    "fontSize", "textColor",  "textAlign", "fontFamily", "textStyle",  "flags",
+    "author",   "subject",    "name",     "text",       "contents",    "creationDate",
+    "modDate",
+};
+
+static bool MdIsKnownKey(Str k) {
+    for (int i = 0; i < dimofi(kMdKnownKeys); i++) {
+        if (str::Eq(k, Str(kMdKnownKeys[i]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool MdIsDigit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static bool MdIsAlpha(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static bool MdIsAlnum(char c) {
+    return MdIsDigit(c) || MdIsAlpha(c);
+}
+
+// true when s can be written unquoted and re-parsed as a string value:
+// non-empty, no JSON-literal lookalike start, not exactly true/false/null,
+// no '"' and no control characters (symmetric with AppendMdLiteral)
+static bool MdIsPlainScalar(Str s) {
+    if (len(s) == 0) {
+        return false;
+    }
+    char c0 = s.s[0];
+    if (c0 == '"' || c0 == '[' || c0 == '{' || c0 == '-' || c0 == '.' || MdIsDigit(c0)) {
+        return false;
+    }
+    if (str::Eq(s, StrL("true")) || str::Eq(s, StrL("false")) || str::Eq(s, StrL("null"))) {
+        return false;
+    }
+    for (int i = 0; i < len(s); i++) {
+        if (s.s[i] == '"' || (u8)s.s[i] < 0x20) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// a JSON-style string; UTF-8 stays raw so the file stays readable
+static void AppendMdJsonString(str::Builder& b, Str s) {
+    b.AppendChar('"');
+    for (int i = 0; i < len(s); i++) {
+        char c = s.s[i];
+        if (c == '"' || c == '\\') {
+            b.AppendChar('\\');
+            b.AppendChar(c);
+        } else if (c == '\n') {
+            b.Append(StrL("\\n"));
+        } else if (c == '\r') {
+            b.Append(StrL("\\r"));
+        } else if (c == '\t') {
+            b.Append(StrL("\\t"));
+        } else if ((u8)c < 0x20) {
+            b.Append(fmt("\\u%04x", (int)(u8)c));
+        } else {
+            b.AppendChar(c);
+        }
+    }
+    b.AppendChar('"');
+}
+
+// numbers keep the JSON serializer's two decimals, trailing zeros trimmed
+// (58.40 -> 58.4, integral values stay integral). TempStr is a struct
+// {char*,int}, so the C string functions go through CStrTemp's char*
+static void AppendMdNumber(str::Builder& b, double v) {
+    if (v == (double)(long long)v && v > -1e15 && v < 1e15) {
+        b.Append(fmt("%lld", (long long)v));
+        return;
+    }
+    char* z = CStrTemp(fmt("%.2f", v));
+    char* dot = strchr(z, '.');
+    if (!dot) {
+        b.Append(Str(z));
+        return;
+    }
+    char* endp = z + strlen(z) - 1;
+    while (endp > dot && *endp == '0') {
+        endp--;
+    }
+    if (endp > dot) {
+        endp++; // keep the last non-zero digit
+    }
+    b.Append(Str(z, (int)(endp - z)));
+}
+
+// compact one-line JSON for arrays / objects (fz_json's layout is public)
+static void AppendMdJsonCompact(str::Builder& b, const fz_json* v) {
+    switch (v->type) {
+        case FZ_JSON_NULL:
+            b.Append(StrL("null"));
+            break;
+        case FZ_JSON_TRUE:
+            b.Append(StrL("true"));
+            break;
+        case FZ_JSON_FALSE:
+            b.Append(StrL("false"));
+            break;
+        case FZ_JSON_NUMBER:
+            AppendMdNumber(b, v->u.number);
+            break;
+        case FZ_JSON_STRING:
+            AppendMdJsonString(b, Str(v->u.string));
+            break;
+        case FZ_JSON_ARRAY:
+            b.AppendChar('[');
+            for (const fz_json_array* a = v->u.array; a; a = a->next) {
+                if (a != v->u.array) {
+                    b.AppendChar(',');
+                }
+                AppendMdJsonCompact(b, a->value);
+            }
+            b.AppendChar(']');
+            break;
+        case FZ_JSON_OBJECT:
+            b.AppendChar('{');
+            for (const fz_json_object* kv = v->u.object; kv; kv = kv->next) {
+                if (kv != v->u.object) {
+                    b.AppendChar(',');
+                }
+                AppendMdJsonString(b, Str(kv->key));
+                b.AppendChar(':');
+                AppendMdJsonCompact(b, kv->value);
+            }
+            b.AppendChar('}');
+            break;
+    }
+}
+
+// the "> key: value" body of a callout for one annotation. Fields come
+// from SerializeAnnotJson via a JSON round-trip so the two formats can
+// never drift apart: one place (the JSON serializer) defines them.
+static void AppendAnnotMdLines(str::Builder& b, fz_context* ctx, const SidecarAnnot& sa, bool crlf) {
+    str::Builder jb;
+    SerializeAnnotJson(jb, sa);
+    Str js = jb.TakeStr();
+    Str eol = crlf ? StrL("\r\n") : StrL("\n");
+    fz_pool* pool = fz_new_pool(ctx);
+    fz_try(ctx) {
+        fz_json* o = fz_parse_json(ctx, pool, CStrTemp(js));
+        if (o && o->type == FZ_JSON_OBJECT) {
+            for (const fz_json_object* kv = o->u.object; kv; kv = kv->next) {
+                b.Append(StrL("> "));
+                b.Append(Str(kv->key));
+                b.Append(StrL(": "));
+                if (kv->value->type == FZ_JSON_STRING && MdIsPlainScalar(Str(kv->value->u.string))) {
+                    b.Append(Str(kv->value->u.string));
+                } else {
+                    AppendMdJsonCompact(b, kv->value);
+                }
+                b.Append(eol);
+            }
+        }
+    }
+    fz_always(ctx) {
+        fz_drop_pool(ctx, pool);
+    }
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+    }
+    str::Free(js);
+}
+
+// output wrapper tracking the last few bytes written, so the merge can
+// look at the tail (blank-line separation) without reaching into
+// str::Builder internals
+struct MdOut {
+    str::Builder b;
+    char tail[4] = {};
+    bool any = false;
+
+    void Append(Str s) {
+        if (len(s) == 0) {
+            return;
+        }
+        b.Append(s);
+        any = true;
+        int n = (int)len(s);
+        if (n >= 4) {
+            memcpy(tail, s.s + n - 4, 4);
+        } else {
+            memmove(tail, tail + n, 4 - n);
+            memcpy(tail + 4 - n, s.s, n);
+        }
+    }
+
+    bool EndsWith(const char* suf, int sufLen) {
+        if (!any || sufLen > 4) {
+            return false;
+        }
+        return 0 == memcmp(tail + (4 - sufLen), suf, (size_t)sufLen);
+    }
+};
+
+// separate a callout from whatever precedes it with one blank line
+// (mirrors the reference implementation: file start / heading, blank,
+// callout)
+static void MdEnsureBlankBefore(MdOut& o, bool crlf) {
+    if (!o.any) {
+        return;
+    }
+    if (crlf) {
+        if (!o.EndsWith("\r\n", 2)) {
+            o.Append(StrL("\r\n"));
+        }
+        if (!o.EndsWith("\r\n\r\n", 4)) {
+            o.Append(StrL("\r\n"));
+        }
+    } else {
+        if (!o.EndsWith("\n", 1)) {
+            o.Append(StrL("\n"));
+        }
+        if (!o.EndsWith("\n\n", 2)) {
+            o.Append(StrL("\n"));
+        }
+    }
+}
+
+struct MdBodyLine {
+    Str line;    // owned, the full "> ..." line without eol
+    bool kv = false;
+    Str key;     // owned when kv
+    Str val;     // owned when kv
+};
+
+struct MdSeg {
+    bool isCallout = false;
+    Str text;   // user segment: verbatim bytes including eols (owned)
+    Str header; // callout header line without eol (owned)
+    Vec<MdBodyLine> body;
+    bool isAnnot = false; // callout parsed to a valid annotation
+    SidecarAnnot annot;  // valid when isAnnot (strings owned)
+};
+
+struct MdDoc {
+    bool hasFm = false;
+    Str fm; // owned, verbatim including both --- lines
+    Vec<MdSeg> segs;
+    bool crlf = false;
+};
+
+static void MdFreeDoc(fz_context* ctx, MdDoc& doc) {
+    str::Free(doc.fm);
+    for (MdSeg& seg : doc.segs) {
+        str::Free(seg.text);
+        str::Free(seg.header);
+        for (MdBodyLine& bl : seg.body) {
+            str::Free(bl.line);
+            if (bl.kv) {
+                str::Free(bl.key);
+                str::Free(bl.val);
+            }
+        }
+        if (seg.isAnnot) {
+            FreeSidecarAnnotStrings(ctx, seg.annot);
+        }
+    }
+}
+
+static Str MdDupLineNoEol(const char* start, const char* endp) {
+    while (endp > start && (endp[-1] == '\n' || endp[-1] == '\r')) {
+        endp--;
+    }
+    return str::Dup(Str(start, (int)(endp - start)));
+}
+
+static bool MdLineIsFmDelim(const char* start, const char* endp) {
+    // line.strip() == '---'
+    while (endp > start && (endp[-1] == '\n' || endp[-1] == '\r' || endp[-1] == ' ' || endp[-1] == '\t')) {
+        endp--;
+    }
+    while (start < endp && (*start == ' ' || *start == '\t')) {
+        start++;
+    }
+    return (endp - start == 3) && start[0] == '-' && start[1] == '-' && start[2] == '-';
+}
+
+// classify "key: value" / "key:: value" body lines (known keys only; the
+// lenient double colon accepts dataview-style hand edits)
+static bool MdParseKvLine(Str inner, Str& key, Str& val) {
+    int n = (int)len(inner);
+    if (n < 1 || !MdIsAlpha(inner.s[0])) {
+        return false;
+    }
+    int i = 1;
+    while (i < n && MdIsAlnum(inner.s[i])) {
+        i++;
+    }
+    Str k = Str(inner.s, i);
+    if (!MdIsKnownKey(k)) {
+        return false;
+    }
+    if (i >= n || inner.s[i] != ':') {
+        return false;
+    }
+    i++;
+    if (i < n && inner.s[i] == ':') {
+        i++;
+    }
+    if (i < n && inner.s[i] == ' ') {
+        i++;
+    }
+    int endp = n;
+    while (endp > i && (inner.s[endp - 1] == ' ' || inner.s[endp - 1] == '\t')) {
+        endp--;
+    }
+    key = str::Dup(k);
+    val = str::Dup(Str(inner.s + i, endp - i));
+    return true;
+}
+
+// value -> JSON literal for the synthesized callout object; a malformed
+// literal (e.g. a number with garbage after it) fails the whole callout
+// parse, which demotes the callout to user content
+static void AppendMdLiteral(str::Builder& b, Str v) {
+    int e = len(v);
+    while (e > 0 && (v.s[e - 1] == ' ' || v.s[e - 1] == '\t' || v.s[e - 1] == '\r')) {
+        e--;
+    }
+    Str s = Str(v.s, e);
+    if (len(s) == 0) {
+        b.Append(StrL("\"\""));
+        return;
+    }
+    char c0 = s.s[0];
+    if (c0 == '"' || c0 == '[' || c0 == '{' || MdIsDigit(c0) || c0 == '-' || c0 == '.') {
+        b.Append(s);
+        return;
+    }
+    if (str::Eq(s, StrL("true")) || str::Eq(s, StrL("false")) || str::Eq(s, StrL("null"))) {
+        b.Append(s);
+        return;
+    }
+    AppendMdJsonString(b, s);
+}
+
+static void MdParseDoc(fz_context* ctx, const char* data, MdDoc& doc) {
+    doc.crlf = strstr(data, "\r\n") != nullptr;
+    const char* end = data + strlen(data);
+
+    const char* ls = data; // line start
+    const char* le = data; // line content end (before the eol)
+    const char* ne = data; // next line start
+
+    // optional front matter: '---' line closed by another '---' within
+    // the next 50 lines; unterminated '---' is not front matter
+    le = ls;
+    while (le < end && *le != '\n') {
+        le++;
+    }
+    ne = (le < end) ? le + 1 : le;
+    if (MdLineIsFmDelim(ls, le)) {
+        const char* fmStart = ls;
+        const char* fmEnd = nullptr;
+        int n = 0;
+        const char* l2 = ne;
+        while (l2 < end && n < 50) {
+            const char* l2e = l2;
+            while (l2e < end && *l2e != '\n') {
+                l2e++;
+            }
+            const char* l2n = (l2e < end) ? l2e + 1 : l2e;
+            n++;
+            if (MdLineIsFmDelim(l2, l2e)) {
+                fmEnd = l2n;
+                break;
+            }
+            l2 = l2n;
+        }
+        if (fmEnd) {
+            doc.hasFm = true;
+            doc.fm = str::Dup(Str(fmStart, (int)(fmEnd - fmStart)));
+            ls = fmEnd;
+        }
+    }
+
+    const char* textStart = nullptr;
+    while (ls < end) {
+        le = ls;
+        while (le < end && *le != '\n') {
+            le++;
+        }
+        ne = (le < end) ? le + 1 : le;
+
+        bool calloutStart = (le - ls >= 4) && ls[0] == '>' && ls[1] == ' ' && ls[2] == '[' && ls[3] == '!';
+        if (calloutStart) {
+            if (textStart && textStart < ls) {
+                MdSeg seg;
+                seg.text = str::Dup(Str(textStart, (int)(ls - textStart)));
+                VecAppend(doc.segs, std::move(seg));
+            }
+            textStart = nullptr;
+            MdSeg seg;
+            seg.isCallout = true;
+            seg.header = MdDupLineNoEol(ls, le);
+            ls = ne;
+            while (ls < end) {
+                const char* bls = ls;
+                const char* ble = bls;
+                while (ble < end && *ble != '\n') {
+                    ble++;
+                }
+                const char* bne = (ble < end) ? ble + 1 : ble;
+                if (ble == bls || bls[0] != '>') {
+                    break; // callout ends at the first non-'>' line
+                }
+                const char* is = bls + 1;
+                if (is < ble && *is == ' ') {
+                    is++;
+                }
+                MdBodyLine bl;
+                bl.line = MdDupLineNoEol(bls, ble);
+                if (MdParseKvLine(Str(is, (int)(ble - is)), bl.key, bl.val)) {
+                    bl.kv = true;
+                }
+                VecAppend(seg.body, std::move(bl));
+                ls = bne;
+            }
+            VecAppend(doc.segs, std::move(seg));
+            textStart = (ls < end) ? ls : nullptr;
+        } else {
+            if (!textStart) {
+                textStart = ls;
+            }
+            ls = ne;
+        }
+    }
+    if (textStart && textStart < end) {
+        MdSeg seg;
+        seg.text = str::Dup(Str(textStart, (int)(end - textStart)));
+        VecAppend(doc.segs, std::move(seg));
+    }
+
+    // parse valid callouts into annotations through the JSON importer
+    // (synthesizing a JSON object from the kv lines reuses
+    // JsonToSidecarAnnot's field semantics verbatim)
+    for (MdSeg& seg : doc.segs) {
+        if (!seg.isCallout) {
+            continue;
+        }
+        bool anyKv = false;
+        str::Builder jb;
+        jb.AppendChar('{');
+        for (MdBodyLine& bl : seg.body) {
+            if (!bl.kv) {
+                continue;
+            }
+            if (anyKv) {
+                jb.AppendChar(',');
+            }
+            anyKv = true;
+            AppendMdJsonString(jb, bl.key);
+            jb.AppendChar(':');
+            AppendMdLiteral(jb, bl.val);
+        }
+        if (!anyKv) {
+            continue; // pure user callout
+        }
+        jb.AppendChar('}');
+        Str js = jb.TakeStr();
+        fz_pool* pool = fz_new_pool(ctx);
+        fz_try(ctx) {
+            fz_json* o = fz_parse_json(ctx, pool, CStrTemp(js));
+            SidecarAnnot sa;
+            if (o && fz_json_is_object(ctx, o) && JsonToSidecarAnnot(ctx, o, sa)) {
+                seg.isAnnot = true;
+                seg.annot = std::move(sa);
+            } else {
+                // may have dup'ed strings before the sanity check failed
+                FreeSidecarAnnotStrings(ctx, sa);
+            }
+        }
+        fz_always(ctx) {
+            fz_drop_pool(ctx, pool);
+        }
+        fz_catch(ctx) {
+            // a value that looks like a literal but does not parse: the
+            // callout is demoted to user content, never dropped
+            fz_report_error(ctx);
+        }
+        str::Free(js);
+    }
+
+    if (doc.hasFm) {
+        const char* v = strstr(doc.fm.s, "sumatrapdf_sidecar:");
+        if (v) {
+            v += strlen("sumatrapdf_sidecar:");
+            while (*v == ' ') {
+                v++;
+            }
+            int ver = atoi(v);
+            if (ver > kSidecarVersion) {
+                logf("sidecar: file version %d > %d, reading anyway\n", ver, kSidecarVersion);
+            }
+        }
+    }
+}
+
+// import a .md sidecar: parse, hand the valid annotations to the caller
+static bool ParseSidecarMd(fz_context* ctx, char* data, Vec<SidecarAnnot>& out) {
+    MdDoc doc;
+    MdParseDoc(ctx, data, doc);
+    for (MdSeg& seg : doc.segs) {
+        if (seg.isCallout && seg.isAnnot) {
+            VecAppend(out, std::move(seg.annot));
+            // the strings moved with the struct; keep MdFreeDoc away from
+            // the moved-from copy
+            seg.isAnnot = false;
+        }
+    }
+    MdFreeDoc(ctx, doc);
+    return true;
+}
+
+// callout <-> live-entry proximity for the merge: same type and page,
+// centers within 4pt and dimensions within 3pt. Looser than PageHasAnnot
+// because the file may have been reformatted by an editor (or the entry
+// nudged by hand) in between
+static bool MdNearAnnot(const SidecarAnnot& a, const SidecarAnnot& b) {
+    if (a.type != b.type || a.pageNo != b.pageNo) {
+        return false;
+    }
+    RectF ra = a.bounds, rb = b.bounds;
+    float cax = ra.x + ra.dx / 2, cay = ra.y + ra.dy / 2;
+    float cbx = rb.x + rb.dx / 2, cby = rb.y + rb.dy / 2;
+    if (fabsf(cax - cbx) > 4 || fabsf(cay - cby) > 4) {
+        return false;
+    }
+    if (fabsf(ra.dx - rb.dx) > 3 || fabsf(ra.dy - rb.dy) > 3) {
+        return false;
+    }
+    return true;
+}
+
+// res[i] = index of the callout matched to entry i, or -1
+static void MdMatchEntries(const Vec<SidecarAnnot>& entries, const MdDoc& doc, Vec<int>& res) {
+    for (int i = 0; i < len(entries); i++) {
+        VecAppend(res, -1);
+    }
+    Vec<bool> used;
+    for (int i = 0; i < len(doc.segs); i++) {
+        VecAppend(used, false);
+    }
+    // pass 1: exact /NM
+    for (int ei = 0; ei < len(entries); ei++) {
+        if (len(entries[ei].name) == 0) {
+            continue;
+        }
+        for (int si = 0; si < len(doc.segs); si++) {
+            if (used[si] || !doc.segs[si].isAnnot) {
+                continue;
+            }
+            if (str::Eq(doc.segs[si].annot.name, entries[ei].name)) {
+                res[ei] = si;
+                used[si] = true;
+                break;
+            }
+        }
+    }
+    // pass 2: proximity
+    for (int ei = 0; ei < len(entries); ei++) {
+        if (res[ei] >= 0) {
+            continue;
+        }
+        for (int si = 0; si < len(doc.segs); si++) {
+            if (used[si] || !doc.segs[si].isAnnot) {
+                continue;
+            }
+            if (MdNearAnnot(entries[ei], doc.segs[si].annot)) {
+                res[ei] = si;
+                used[si] = true;
+                break;
+            }
+        }
+    }
+}
+
+// write through a same-directory temp file + MoveFileExW(REPLACE_EXISTING):
+// a Markdown sidecar also carries the user's own notes, so a crash or
+// power loss mid-write must never leave a half-written file behind
+// (pattern: PngOptimizer.cpp). Falls back to a plain write when the
+// atomic replace is refused (unusual filesystems); the temp name carries
+// the pid so concurrent processes never fight over one temp file
+static bool WriteSidecarFileAtomic(Str path, Str data) {
+    TempStr dir = path::GetDirTemp(path);
+    TempStr base = path::GetBaseNameTemp(path);
+    if (len(dir) == 0 || len(base) == 0) {
+        return file::WriteFile(path, data);
+    }
+    str::Builder b;
+    b.Append(dir);
+    b.AppendChar(PathSepFor(Str(dir)));
+    b.AppendChar('.');
+    b.Append(Str(base));
+    b.Append(fmt(".tmp%d", (int)GetCurrentProcessId()));
+    Str tmpPath = b.TakeStr();
+    bool ok = file::WriteFile(tmpPath, data);
+    if (ok) {
+        if (MoveFileExW(CWStrTemp(tmpPath), CWStrTemp(path), MOVEFILE_REPLACE_EXISTING)) {
+            str::Free(tmpPath);
+            return true;
+        }
+        logf("sidecar: atomic replace failed (err=%u), falling back to plain write\n", GetLastError());
+        ok = file::WriteFile(path, data);
+    }
+    file::Delete(tmpPath);
+    str::Free(tmpPath);
+    return ok;
+}
+
+// build the merged .md for the tab's document: existing file parsed and
+// preserved (front matter, user text, callout headers and user body lines),
+// matched callouts rewritten from the live entries, deleted annotations'
+// callouts dropped, new entries appended
+static Str BuildSidecarMd(EngineMupdf* e, Str pdfPath, const Vec<SidecarAnnot>& entries, Str existingMd) {
+    fz_context* ctx = e->Ctx();
+    MdDoc doc;
+    if (len(existingMd) > 0) {
+        char* z = CStrTemp(existingMd);
+        MdParseDoc(ctx, z, doc);
+    }
+    Vec<int> res;
+    MdMatchEntries(entries, doc, res);
+
+    bool crlf = doc.crlf;
+    Str eol = crlf ? StrL("\r\n") : StrL("\n");
+    MdOut out;
+    if (doc.hasFm) {
+        out.Append(doc.fm);
+    } else {
+        str::Builder fb;
+        fb.Append(StrL("---"));
+        fb.Append(eol);
+        fb.Append(fmt("sumatrapdf_sidecar: %d", kSidecarVersion));
+        fb.Append(eol);
+        fb.Append(StrL("generator: SumatraPDF-sidecar/2-md"));
+        fb.Append(eol);
+        TempStr base = path::GetBaseNameTemp(pdfPath);
+        if (base && len(base) > 0) {
+            fb.Append(StrL("file: "));
+            fb.Append(Str(base));
+            fb.Append(eol);
+        }
+        Str title = DocTitle(e);
+        if (len(title) > 0) {
+            fb.Append(StrL("title: "));
+            fb.Append(title);
+            fb.Append(eol);
+            str::Free(title);
+        }
+        fb.Append(StrL("---"));
+        fb.Append(eol);
+        out.Append(fb.TakeStr());
+    }
+
+    Vec<int> segToEntry;
+    for (int i = 0; i < len(doc.segs); i++) {
+        VecAppend(segToEntry, -1);
+    }
+    for (int ei = 0; ei < len(res); ei++) {
+        if (res[ei] >= 0) {
+            segToEntry[res[ei]] = ei;
+        }
+    }
+
+    for (int si = 0; si < len(doc.segs); si++) {
+        MdSeg& seg = doc.segs[si];
+        if (!seg.isCallout) {
+            out.Append(seg.text);
+            continue;
+        }
+        int ei = segToEntry[si];
+        if (ei >= 0) {
+            // rewrite this callout in place from the live entry; the
+            // header line and user body lines survive untouched
+            MdEnsureBlankBefore(out, crlf);
+            out.Append(seg.header);
+            out.Append(eol);
+            str::Builder kb;
+            AppendAnnotMdLines(kb, ctx, entries[ei], crlf);
+            out.Append(kb.TakeStr());
+            for (MdBodyLine& bl : seg.body) {
+                if (!bl.kv) {
+                    out.Append(bl.line);
+                    out.Append(eol);
+                }
+            }
+        } else if (seg.isAnnot) {
+            // the annotation is gone: drop the callout
+        } else {
+            // user-content callout: preserved verbatim
+            MdEnsureBlankBefore(out, crlf);
+            out.Append(seg.header);
+            out.Append(eol);
+            for (MdBodyLine& bl : seg.body) {
+                out.Append(bl.line);
+                out.Append(eol);
+            }
+        }
+    }
+    for (int ei = 0; ei < len(entries); ei++) {
+        if (res[ei] < 0) {
+            // new annotation: append at the end
+            MdEnsureBlankBefore(out, crlf);
+            out.Append(StrL("> [!Note]"));
+            out.Append(eol);
+            str::Builder kb;
+            AppendAnnotMdLines(kb, ctx, entries[ei], crlf);
+            out.Append(kb.TakeStr());
+        }
+    }
+    if (out.any && !out.EndsWith(crlf ? "\r\n" : "\n", crlf ? 2 : 1)) {
+        out.Append(eol);
+    }
+    MdFreeDoc(ctx, doc);
+    return out.b.TakeStr();
 }
 
 // ---------------------------------------------------------------------------
@@ -2383,6 +3173,12 @@ void SidecarMaybeImport(EngineBase* engine) {
 
     SidecarTarget sib = ResolveSiblingTarget(pdfPath);
     SidecarTarget cen = ResolveCentralTarget(pdfPath);
+    if (SidecarMdEnabled() && !sib.exists && !cen.exists) {
+        // no .md anywhere: fall back to .json (read-only; the next manual
+        // save writes the .md - automatic migration, the .json is kept)
+        sib = ResolveSiblingTargetExt(pdfPath, ".json");
+        cen = ResolveCentralTargetExt(pdfPath, ".json");
+    }
     SidecarTarget use;
     if (sib.exists) {
         use = sib;
@@ -2405,7 +3201,9 @@ void SidecarMaybeImport(EngineBase* engine) {
     char* z = CStrTemp(data);
     Vec<SidecarAnnot> entries;
     fz_context* ctx = e->Ctx();
-    if (!ParseSidecarJson(ctx, z, entries)) {
+    bool parseOk = str::EndsWithI(use.path, StrL(".md")) ? ParseSidecarMd(ctx, z, entries)
+                                                         : ParseSidecarJson(ctx, z, entries);
+    if (!parseOk) {
         logf("sidecar: failed to parse '%s'\n", use.path);
     }
     str::Free(data); // entry strings were dup'ed out of the JSON DOM
@@ -2468,9 +3266,20 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
     EngineMupdfGetAnnotations(engine, annots);
     int nSkippedUnsupported = 0;
     Vec<SidecarAnnot> entries;
-    Str json = BuildSidecarJson(e, annots, pdfPath, nSkippedUnsupported, entries);
-    if (len(json) == 0) {
-        ShowWarningNotification(win->hwndCanvas, StrL("Failed to build JSON sidecar"), 5000);
+    CollectSidecarEntries(e, annots, nSkippedUnsupported, entries);
+    Str data;
+    if (SidecarMdEnabled()) {
+        Str existing;
+        if (tgt.exists) {
+            existing = file::ReadFile(tgt.path);
+        }
+        data = BuildSidecarMd(e, pdfPath, entries, existing);
+        str::Free(existing);
+    } else {
+        data = BuildSidecarJson(e, pdfPath, entries);
+    }
+    if (len(data) == 0) {
+        ShowWarningNotification(win->hwndCanvas, StrL("Failed to build sidecar"), 5000);
         fz_context* ctx = e->Ctx();
         for (SidecarAnnot& sa : entries) {
             FreeSidecarAnnotStrings(ctx, sa);
@@ -2485,18 +3294,18 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
             dir::CreateAll(dir);
         }
     }
-    if (!file::WriteFile(tgt.path, json)) {
+    if (!WriteSidecarFileAtomic(tgt.path, data)) {
         ShowWarningNotification(win->hwndCanvas,
                                 fmt(Tr("Failed to save '%s': %s").s, tgt.path, StrL("cannot write file")), 5000);
         logf("sidecar: failed to write '%s'\n", tgt.path);
-        str::Free(json);
+        str::Free(data);
         fz_context* ctx = e->Ctx();
         for (SidecarAnnot& sa : entries) {
             FreeSidecarAnnotStrings(ctx, sa);
         }
         return SidecarResult::Failed;
     }
-    str::Free(json);
+    str::Free(data);
 
     // write the payload files (stamp images / attachment contents) into
     // assets/ next to the JSON, then remove asset files that no sidecar

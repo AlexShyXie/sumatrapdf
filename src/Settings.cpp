@@ -358,17 +358,18 @@ static const FieldInfo gAnnotationsFields[] = {
     {offsetof(Annotations, textIconType), SettingType::String, (intptr_t)""},
     {offsetof(Annotations, defaultAuthor), SettingType::String, (intptr_t)""},
     {offsetof(Annotations, separateSave), SettingType::Bool, false},
+    {offsetof(Annotations, separateSaveAsMd), SettingType::Bool, false},
     {offsetof(Annotations, centralFolder), SettingType::String, (intptr_t)""},
     {offsetof(Annotations, signatureImage), SettingType::String, 0},
 };
 static const StructInfo gAnnotationsInfo = {
     sizeof(Annotations),
-    28,
+    29,
     gAnnotationsFields,
     "HighlightColor\0UnderlineColor\0SquigglyColor\0StrikeOutColor\0FreeTextColor\0FreeTextBackgroundColor\0FreeTextOpa"
     "city\0FreeTextSize\0FreeTextBorderWidth\0FreeTextAlignment\0PresetColors\0TextIconColor\0LineColor\0PolyLineColor"
     "\0SquareColor\0CircleColor\0PolygonColor\0InkColor\0InkColors\0InkBorderWidth\0StampColor\0CaretColor\0FileAttachm"
-    "entColor\0TextIconType\0DefaultAuthor\0SeparateSave\0CentralFolder\0SignatureImage",
+    "entColor\0TextIconType\0DefaultAuthor\0SeparateSave\0SeparateSaveAsMd\0CentralFolder\0SignatureImage",
     "color of newly created highlight annotations. Use an #aarrggbb value to set default opacity (00 = transparent, FF "
     "= opaque); #rrggbb is fully opaque\0color of newly created underline annotations. #aarrggbb sets default opacity "
     "the same way as HighlightColor\0color of newly created squiggly underline annotations. #aarrggbb sets default "
@@ -395,7 +396,8 @@ static const StructInfo gAnnotationsInfo = {
     "new paragraph, note or paragraph. If not set, note is used\0author recorded on newly created annotations. If not "
     "set, the Windows user name is used; set it to (none) to leave the author out entirely\0if true, annotations are "
 "saved as a separate JSON file next to the PDF (or under CentralFolder) instead of inside the PDF; the PDF is "
-"never modified\0central folder for JSON annotation files, used when no such file exists next to the PDF: the "
+"never modified\0if true, sidecar files are Markdown (.md) instead of JSON: annotations are stored as Obsidian-"
+"style callouts and everything else in the file is preserved for your own notes\0central folder for JSON annotation files, used when no such file exists next to the PDF: the "
 "file is looked up in <CentralFolder>/<pdf parent folder name>/<pdf name>.json\0image (e.g. a transparent "
     ".png of your signature) that Sign With Image stamps on the page. If not set, or the file is missing, Sign With "
     "Image asks for an image",

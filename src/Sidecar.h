@@ -19,6 +19,12 @@
 // then central. Saving resolves the target the same way, so both stay
 // consistent without extra per-tab state.
 //
+// With Annotations->SeparateSaveAsMd the same data is stored as Markdown:
+// annotations become Obsidian-style callouts and everything else in the
+// file is preserved verbatim for the user's own notes. Import prefers the
+// .md file and falls back to .json (a legacy .json is never rewritten);
+// see the "Markdown sidecar" section in Sidecar.cpp for the format.
+//
 // Schema (version 2), one file per document:
 //
 //   {

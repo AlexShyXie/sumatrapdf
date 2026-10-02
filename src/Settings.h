@@ -781,6 +781,11 @@ struct Annotations {
     // (or under CentralFolder) instead of inside the PDF. The PDF itself is
     // never modified; see Sidecar.h
     bool separateSave;
+    // SIDECAR: with SeparateSave, persist the sidecar as Markdown (.md)
+    // instead of JSON - annotations become Obsidian-style callouts and
+    // everything that is not an annotation callout is preserved verbatim
+    // for the user's own notes (see the MD format comment in Sidecar.cpp)
+    bool separateSaveAsMd;
     // SIDECAR: central folder for JSON sidecar files, used when no sibling
     // file exists: <CentralFolder>/<pdf parent folder name>/<pdf name>.json
     Str centralFolder;
