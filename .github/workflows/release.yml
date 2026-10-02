@@ -32,4 +32,11 @@ jobs:
           $ver = $env:TAG.TrimStart("v")
           $asset = "SumatraPDF-$ver.exe"
           Copy-Item out\rel64\SumatraPDF-static.exe $asset
-          gh release create $env:TAG $asset --title "SumatraPDF $env:TAG" --generate-notes
+          # fill the unsigned-run instructions with version / repo / checksum
+          $sha256 = (Get-FileHash $asset -Algorithm SHA256).Hash
+          $tmpl = Join-Path $env:GITHUB_WORKSPACE ".github/release-notes-template.md"
+          $notes = [IO.File]::ReadAllText($tmpl)
+          $notes = $notes.Replace('$VERSION', $ver).Replace('$REPO_SLUG', $env:GITHUB_REPOSITORY).Replace('$SHA256', $sha256)
+          $tmp = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          [IO.File]::WriteAllText($tmp, $notes, [Text.UTF8Encoding]::new($false))
+          gh release create $env:TAG $asset --title "SumatraPDF $env:TAG" --notes-file $tmp --generate-notes
