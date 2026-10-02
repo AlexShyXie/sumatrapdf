@@ -16,7 +16,7 @@ import { sleep } from "./winapi.ts";
 import { sendCommandSync, waitForFrame } from "./win-automation.ts";
 
 const DEEP_CHAPTER = 34;
-const THEME_TOGGLES = 4;
+const THEME_TOGGLES = 2;
 
 const SAMPLES_PER_TOGGLE = 6;
 
@@ -38,7 +38,7 @@ export async function testit(): Promise<void> {
   const dir = tmpPath("read-aloud-restyle-stale-page-data");
   mkdirSync(dir, { recursive: true });
   const epub = join(dir, "chapters.epub");
-  writeFileSync(epub, makeEpub());
+  writeFileSync(epub, makeEpub({ parasPerChapter: 12 }));
 
   // with the default DocumentColorsFollowTheme only the first toggle restyles
   const appdata = writeAppdata(

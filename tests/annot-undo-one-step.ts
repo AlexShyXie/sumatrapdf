@@ -19,9 +19,11 @@ import {
   WM_CHAR,
   WM_COMMAND,
 } from "./winapi.ts";
-import { clickAt, findCanvas, killAndWait, launchControlled, sendCommand, sendCommandSync } from "./win-automation.ts";
+import { clickAt, findCanvas, killAndWait, launchControlled, sendCommandSync } from "./win-automation.ts";
 
 type State = { raw: string; annotations: number; canUndo: boolean; modified: boolean; editActive: boolean };
+
+type Rect = { x: number; y: number; dx: number; dy: number };
 
 const SETTINGS = [
   "UiLanguage = en",
@@ -109,15 +111,56 @@ async function waitFor(client: ControlClient, pred: (s: State) => boolean, what:
 }
 
 async function undo(client: ControlClient, frame: number): Promise<State> {
-  sendCommand(frame, cmdId("CmdUndo"));
+  sendCommandSync(frame, cmdId("CmdUndo"));
   await client.waitForRenderIdle();
-  await sleep(150 * SLOW_BUILD_FACTOR);
   return state(client);
 }
 
 function want(s: State, what: string, cond: boolean): void {
   if (!cond) {
     throw new Error(`annot-undo-one-step: ${what}\n${s.raw}`);
+  }
+}
+
+function squareOf(raw: string): Rect | null {
+  const sq = /type=Square[^\n]*screen=(-?\d+),(-?\d+),(-?\d+),(-?\d+)/.exec(raw);
+  if (!sq) {
+    return null;
+  }
+  return { x: +sq[1]!, y: +sq[2]!, dx: +sq[3]!, dy: +sq[4]! };
+}
+
+function sameRect(a: Rect | null, b: Rect | null): boolean {
+  return !!a && !!b && a.x === b.x && a.y === b.y && a.dx === b.dx && a.dy === b.dy;
+}
+
+function clickSquare(canvas: number, sq: Rect): Promise<void> {
+  return clickAt(canvas, sq.x + Math.floor(sq.dx / 2), sq.y + Math.floor(sq.dy / 2), 0);
+}
+
+function propertiesShown(raw: string): boolean {
+  return /annotEditToolbar visible=1/.test(raw);
+}
+
+// Edit PDF refits the page, so the square can move between the read and the click.
+async function stableSquare(client: ControlClient): Promise<Rect> {
+  await client.waitForRenderIdle();
+  let prev = squareOf((await state(client)).raw);
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    await sleep(40);
+    const s = await state(client);
+    const cur = squareOf(s.raw);
+    if (sameRect(prev, cur) && cur) {
+      return cur;
+    }
+    if (Date.now() > deadline) {
+      if (!cur) {
+        throw new Error(`annot-undo-one-step: no square on the page\n${s.raw}`);
+      }
+      return cur;
+    }
+    prev = cur;
   }
 }
 
@@ -178,7 +221,6 @@ async function testFreeText(): Promise<void> {
       throw new Error("annot-undo-one-step: no in-place edit box");
     }
     sendText(box, "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight");
-    await sleep(200 * SLOW_BUILD_FACTOR);
     // Ctrl+Enter reaches the edit control as LF
     sendMessage(box, WM_CHAR, 0x0a, 0);
     await waitFor(client, (st) => !st.editActive, "the edit did not commit");
@@ -201,16 +243,19 @@ async function testColorPick(): Promise<void> {
   const { proc, client, frame } = await launch("square", makeSquarePdf());
   try {
     const canvas = findCanvas(frame);
-    sendCommand(frame, cmdId("CmdToggleEditPDF"));
-    await sleep(400 * SLOW_BUILD_FACTOR);
+    sendCommandSync(frame, cmdId("CmdToggleEditPDF"));
+    const aimed = await stableSquare(client);
+    await clickSquare(canvas, aimed);
     let s = await state(client);
-    const sq = /type=Square[^\n]*screen=(-?\d+),(-?\d+),(\d+),(\d+)/.exec(s.raw);
-    if (!sq) {
-      throw new Error(`annot-undo-one-step: no square on the page\n${s.raw}`);
+    // one more click at the current center if the property row is still hidden
+    if (!propertiesShown(s.raw)) {
+      await clickSquare(canvas, squareOf(s.raw) ?? aimed);
     }
-    await clickAt(canvas, +sq[1]! + Math.floor(+sq[3]! / 2), +sq[2]! + Math.floor(+sq[4]! / 2));
-    await sleep(400 * SLOW_BUILD_FACTOR);
-    await client.waitForRenderIdle();
+    await waitFor(
+      client,
+      (st) => propertiesShown(st.raw),
+      `selecting the square did not show its properties\naimed=${aimed.x},${aimed.y},${aimed.dx},${aimed.dy}`,
+    );
 
     const swatches = await openChipDropdown(client, proc.pid!, "interiorColor");
     await pickSwatch(client, proc.pid!, swatches, 1);

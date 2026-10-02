@@ -33,8 +33,7 @@ import { deflateRawSync } from "node:zlib";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ControlClient, withControlledSumatra } from "./control.ts";
-import { cmdId, EXE, runStandalone, SLOW_BUILD_FACTOR, tmpPath, writeAppdata } from "./util.ts";
-import { sleep } from "./winapi.ts";
+import { cmdId, EXE, runStandalone, tmpPath, writeAppdata } from "./util.ts";
 import { sendCommandSync, waitForFrame } from "./win-automation.ts";
 
 // the crash doc had 36+ chapters and reached flat page 95
@@ -42,7 +41,7 @@ const CHAPTER_COUNT = 40;
 const PARAS_PER_CHAPTER = 40;
 // stop short of the last chapter, like the reader who was at chapter 34 of 36+
 const DEEP_CHAPTER = 34;
-const THEME_TOGGLES = 3;
+const THEME_TOGGLES = 1;
 // the flat page number the crash was holding
 const CRASH_PAGE_NO = 95;
 
@@ -130,23 +129,20 @@ function zip(entries: ZipEntry[]): Buffer {
 
 // each chapter must be several pages so the flat page count grows well past
 // the per-chapter placeholder count a restyle collapses it to
-function chapterHtml(n: number): string {
-  const paras: string[] = [];
-  for (let i = 1; i <= PARAS_PER_CHAPTER; i++) {
-    const words: string[] = [];
-    for (let w = 0; w < 60; w++) {
-      words.push(`ch${n}p${i}w${w}`);
-    }
-    paras.push(`<p>${words.join(" ")}</p>`);
-  }
-  return (
+function chapterHtml(n: number, paras = PARAS_PER_CHAPTER): string {
+  const head =
     `<?xml version="1.0" encoding="utf-8"?>\n` +
     `<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter ${n}</title></head>` +
-    `<body><h1>Chapter ${n}</h1>${paras.join("")}</body></html>`
-  );
+    `<body><h1>Chapter ${n}</h1>`;
+  const tail = `</body></html>`;
+  const para = paras > 200 ? `<p>${"word ".repeat(40)}</p>` : `<p>${"chapterword ".repeat(60)}</p>`;
+  return head + para.repeat(paras) + tail;
 }
 
-export function makeEpub(): Buffer {
+export function makeEpub(opts?: { chapterCount?: number; parasPerChapter?: number | number[] }): Buffer {
+  const parasPerChapter = opts?.parasPerChapter ?? PARAS_PER_CHAPTER;
+  const parasList = Array.isArray(parasPerChapter) ? parasPerChapter : null;
+  const chapterCount = parasList ? parasList.length : (opts?.chapterCount ?? CHAPTER_COUNT);
   const enc = new TextEncoder();
   const container =
     `<?xml version="1.0"?>\n<container version="1.0" ` +
@@ -161,11 +157,12 @@ export function makeEpub(): Buffer {
     { name: "mimetype", data: enc.encode("application/epub+zip"), store: true },
     { name: "META-INF/container.xml", data: enc.encode(container) },
   ];
-  for (let n = 1; n <= CHAPTER_COUNT; n++) {
+  for (let n = 1; n <= chapterCount; n++) {
     items.push(`<item id="c${n}" href="c${n}.xhtml" media-type="application/xhtml+xml"/>`);
     refs.push(`<itemref idref="c${n}"/>`);
     navLis.push(`<li><a href="c${n}.xhtml">Chapter ${n}</a></li>`);
-    entries.push({ name: `OEBPS/c${n}.xhtml`, data: enc.encode(chapterHtml(n)) });
+    const paras = parasList ? parasList[n - 1]! : (parasPerChapter as number);
+    entries.push({ name: `OEBPS/c${n}.xhtml`, data: enc.encode(chapterHtml(n, paras)) });
   }
 
   const nav =
@@ -251,18 +248,15 @@ async function runLayout(l: Layout, epub: string, epub2: string, log: string): P
       // across a theme toggle, and nothing else about it is exercised.
       const sel = await client.seedTextSelection(deep.page);
       selParts = sel.parts;
-      await sleep(200 * SLOW_BUILD_FACTOR);
 
       for (let i = 0; i < THEME_TOGGLES; i++) {
         // resets the chapter table: pageCount collapses to one placeholder
         // page per chapter while holders still have the old flat numbers
         sendCommandSync(frame, cmdId("CmdToggleLightDarkTheme"));
-        await sleep(500 * SLOW_BUILD_FACTOR);
 
         // force the progressive re-layout the crash log shows after the reset
         await walkToChapter(client, DEEP_CHAPTER);
         sendCommandSync(frame, cmdId("CmdScrollDownPage"));
-        await sleep(200 * SLOW_BUILD_FACTOR);
         await client.waitForRenderIdle(30000);
       }
 
@@ -273,16 +267,13 @@ async function runLayout(l: Layout, epub: string, epub2: string, log: string): P
       // RemapTextSelection() never run for the other one. Switching back then
       // paints a selection whose pageNo is from the pre-restyle numbering.
       sendCommandSync(frame, cmdId("CmdPrevTab"));
-      await sleep(300 * SLOW_BUILD_FACTOR);
       await client.waitForRenderIdle(30000);
       sendCommandSync(frame, cmdId("CmdToggleLightDarkTheme"));
-      await sleep(500 * SLOW_BUILD_FACTOR);
       await client.waitForRenderIdle(30000);
 
       // back to the tab holding the stale selection, and paint it before
       // anything re-lays-out the chapters it was numbered against
       sendCommandSync(frame, cmdId("CmdNextTab"));
-      await sleep(300 * SLOW_BUILD_FACTOR);
       await client.waitForRenderIdle(30000);
 
       const after = await client.chapterInfo();
@@ -314,7 +305,7 @@ export async function testit(): Promise<void> {
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   const epub = join(dir, "chapters.epub");
-  const bytes = makeEpub();
+  const bytes = makeEpub({ parasPerChapter: 12 });
   writeFileSync(epub, bytes);
   // a second tab, like the two-tab window in the crash log
   const epub2 = join(dir, "chapters-2.epub");

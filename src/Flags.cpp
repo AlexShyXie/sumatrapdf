@@ -353,8 +353,9 @@ FileArgs* ParseFileArgs(Str path) {
     if (!str::CutCharLast(path, '?', &before, &after)) {
         return nullptr;
     }
-    // don't mutilate long file paths that start with "\\?\"
-    if (before.len == 2) {
+    // don't mutilate long file paths that start with "\\?\", or ones with a
+    // '?' but no file before it (a garbled drive letter: "?:\foo.pdf")
+    if (before.len == 2 || before.len == 0) {
         return nullptr;
     }
     FileArgs* res = new FileArgs();
@@ -369,9 +370,7 @@ void ParseFlags(Arena* a, WStr cmdLine, Flags& i, Str toolNames) {
     ReportIf(!a);
     // logf("ParseFlags: cmdLine: '%s'\n", ToUtf8Temp(cmdLine));
     StrNode* root = ParseCmdLine(cmdLine);
-    defer {
-        FreeStrNode(nullptr, root);
-    };
+    AutoFreeStrNode freeRoot(root);
     StrNode* firstArg = root ? root->next : nullptr;
 
     // if the first argument is a tool name, skip parsing flags entirely

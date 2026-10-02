@@ -23,6 +23,7 @@
 #include "gui/Layout.h"
 #include "gui/PlatformFont.h"
 #include "gui/win/WinGui.h"
+#include "gui/VirtCtrl.h"
 
 #include "Settings.h"
 #include "DisplayMode.h"
@@ -46,6 +47,7 @@
 #include "AnnotFilterToolbar.h"
 #include "Notifications.h"
 #include "MainWindow.h"
+#include "SidebarPanel.h"
 #include "AnnotPlacement.h"
 #include "Menu.h"
 #include "uia/Provider.h"
@@ -1587,12 +1589,36 @@ bool NudgeSelectedAnnotation(MainWindow* win, WPARAM key) {
     r.y += pTo.y - pFrom.y;
     SetRect(annot, r);
 
-    NotifyAnnotationsChanged(tab);
-    MainWindowRerender(win);
-    ToolbarUpdateStateForWindow(win, true);
-    UpdateAnnotFilterToolbar(win);
+    // the selection box and edit toolbar follow right away, over the old page
+    // bitmap; the page and the rest of the UI update once the keys pause
+    HwndInvalidate(win->hwndCanvas);
     RepositionAnnotEditToolbar(win);
+    if (win->annotationNudgeTab != tab || win->annotationNudgePageNo != pageNo) {
+        FinishAnnotationNudge(win);
+    }
+    win->annotationNudgeTab = tab;
+    win->annotationNudgePageNo = pageNo;
+    SetTimer(win->hwndCanvas, kAnnotationNudgeTimerID, kAnnotationNudgeDelayMs, nullptr);
     return true;
+}
+
+// the debounced half of NudgeSelectedAnnotation
+void FinishAnnotationNudge(MainWindow* win) {
+    if (!win || !win->annotationNudgeTab) {
+        return;
+    }
+    KillTimer(win->hwndCanvas, kAnnotationNudgeTimerID);
+    WindowTab* tab = win->annotationNudgeTab;
+    int pageNo = win->annotationNudgePageNo;
+    win->annotationNudgeTab = nullptr;
+    win->annotationNudgePageNo = 0;
+    // the tab may have been closed meanwhile
+    if (!VecContains(win->Tabs(), tab)) {
+        return;
+    }
+    RerenderTabPage(tab, pageNo);
+    NotifyAnnotationsChanged(tab);
+    ToolbarUpdateStateForWindow(win, true);
 }
 
 static void StopMouseDrag(MainWindow* win, int x, int y, bool aborted) {
@@ -1814,6 +1840,50 @@ static Annotation* AnnotationLockingMouse(MainWindow* win) {
 // started must not act on the page
 static bool gPressOnlyDeselected = false;
 
+// Shift snaps a line end or polyline vertex. Mouse-up applies this too: SetCapture
+// posts a move at the real cursor with no key flags, after the last drag sample.
+static void UpdateDraggedLineOrVertex(MainWindow* win, DisplayModel* dm, int x, int y, WPARAM key) {
+    Annotation* annot = win->annotationBeingDragged;
+    if (!annot || !dm) {
+        return;
+    }
+    auto handle = (ResizeHandle)win->resizeHandle;
+    bool shift = IsShiftPressed() || bit::IsMaskSet(key, (WPARAM)MK_SHIFT);
+    if (IsLineEndpointHandle(handle)) {
+        int linePageNo = PageNo(annot);
+        Point screenPt{x, y};
+        if (shift) {
+            Point fixed = handle == ResizeHandle::LineStart
+                              ? dm->CvtToScreen(linePageNo, win->annotationOriginalLineEnd)
+                              : dm->CvtToScreen(linePageNo, win->annotationOriginalLineStart);
+            screenPt = SnapLineEndpoint(fixed, screenPt);
+        }
+        PointF pagePt = dm->CvtFromScreen(screenPt, linePageNo);
+        if (handle == ResizeHandle::LineStart) {
+            win->annotationLinePreviewStart = pagePt;
+        } else {
+            win->annotationLinePreviewEnd = pagePt;
+        }
+        return;
+    }
+    if (!IsVertexHandle(handle)) {
+        return;
+    }
+    Vec<PointF>& pts = win->annotationVertexPreview;
+    int idx = win->annotationResizeVertexIndex;
+    if (idx < 0 || idx >= len(pts)) {
+        return;
+    }
+    Point screenPt{x, y};
+    // snap to the segment from the previous vertex (next one for the first)
+    int anchor = idx > 0 ? idx - 1 : idx + 1;
+    if (shift && anchor < len(pts)) {
+        int polyPageNo = PageNo(annot);
+        screenPt = SnapLineEndpoint(dm->CvtToScreen(polyPageNo, pts[anchor]), screenPt);
+    }
+    pts[idx] = dm->CvtFromScreen(screenPt, PageNo(annot));
+}
+
 static void OnMouseMove(MainWindow* win, int x, int y, WPARAM key) {
     if (ReadingBarOnMouseMove(win, x, y)) {
         return;
@@ -2015,38 +2085,9 @@ static void OnMouseMove(MainWindow* win, int x, int y, WPARAM key) {
                     auto handle = (ResizeHandle)win->resizeHandle;
                     SetCursorCached(GetCursorForResizeHandle(handle));
 
-                    if (IsLineEndpointHandle(handle)) {
-                        int linePageNo = PageNo(annot);
-                        Point screenPt{x, y};
-                        if (IsShiftPressed() || bit::IsMaskSet(key, (WPARAM)MK_SHIFT)) {
-                            Point fixed = handle == ResizeHandle::LineStart
-                                              ? dm->CvtToScreen(linePageNo, win->annotationOriginalLineEnd)
-                                              : dm->CvtToScreen(linePageNo, win->annotationOriginalLineStart);
-                            screenPt = SnapLineEndpoint(fixed, screenPt);
-                        }
-                        PointF pagePt = dm->CvtFromScreen(screenPt, linePageNo);
-                        if (handle == ResizeHandle::LineStart) {
-                            win->annotationLinePreviewStart = pagePt;
-                        } else {
-                            win->annotationLinePreviewEnd = pagePt;
-                        }
-                        // Overlay only: leave the PDF page bitmap alone until
-                        // the drag ends.
-                        ScheduleRepaint(win, 0);
-                    } else if (IsVertexHandle(handle)) {
-                        int polyPageNo = PageNo(annot);
-                        Vec<PointF>& pts = win->annotationVertexPreview;
-                        int idx = win->annotationResizeVertexIndex;
-                        if (idx >= 0 && idx < len(pts)) {
-                            Point screenPt{x, y};
-                            // snap to the segment from the previous vertex (next one for the first)
-                            int anchor = idx > 0 ? idx - 1 : idx + 1;
-                            bool shift = IsShiftPressed() || bit::IsMaskSet(key, (WPARAM)MK_SHIFT);
-                            if (shift && anchor < len(pts)) {
-                                screenPt = SnapLineEndpoint(dm->CvtToScreen(polyPageNo, pts[anchor]), screenPt);
-                            }
-                            pts[idx] = dm->CvtFromScreen(screenPt, polyPageNo);
-                        }
+                    if (IsLineEndpointHandle(handle) || IsVertexHandle(handle)) {
+                        // Overlay only: leave the PDF page bitmap alone until the drag ends.
+                        UpdateDraggedLineOrVertex(win, dm, x, y, key);
                         ScheduleRepaint(win, 0);
                     } else if (win->annotationResizeOutlineOnly) {
                         // Outline only: writing the annotation re-lays out its
@@ -2686,6 +2727,9 @@ static void OnMouseLeftButtonUp(MainWindow* win, int x, int y, WPARAM key) {
     bool didDragMouse = !win->dragStartPending || IsDragDistance(x, win->dragStart.x, y, win->dragStart.y);
     if (MouseAction::Dragging == ma) {
         if (win->annotationBeingResized) {
+            if (didDragMouse) {
+                UpdateDraggedLineOrVertex(win, dm, x, y, key);
+            }
             StopAnnotationResize(win, !didDragMouse);
             // Trigger cursor update after resize
             SendMessageW(win->hwndCanvas, WM_SETCURSOR, 0, 0);
@@ -4503,7 +4547,8 @@ static bool RefHoverTakesWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM lp) 
 
 static LRESULT CanvasOnMouseWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM lp) {
     // Scroll the ToC sidebar, if it's visible and the cursor is in it
-    if (win->uiState.tocVisible && HwndIsCursorOverWindow(win->tocTreeView->hwnd) && !gWheelMsgRedirect) {
+    if (IsSidebarViewShown(win, SidebarView::Bookmarks) && HwndIsCursorOverWindow(win->tocTreeView->hwnd) &&
+        !gWheelMsgRedirect) {
         // Note: hwndTocTree's window procedure doesn't always handle
         //       WM_MOUSEWHEEL and when it's bubbling up, we'd return
         //       here recursively - prevent that
@@ -4808,7 +4853,8 @@ static LRESULT CanvasOnMouseWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM l
 
 static LRESULT CanvasOnMouseHWheel(MainWindow* win, UINT msg, WPARAM wp, LPARAM lp) {
     // Scroll the ToC sidebar, if it's visible and the cursor is in it
-    if (win->uiState.tocVisible && HwndIsCursorOverWindow(win->tocTreeView->hwnd) && !gWheelMsgRedirect) {
+    if (IsSidebarViewShown(win, SidebarView::Bookmarks) && HwndIsCursorOverWindow(win->tocTreeView->hwnd) &&
+        !gWheelMsgRedirect) {
         // Note: hwndTocTree's window procedure doesn't always handle
         //       WM_MOUSEHWHEEL and when it's bubbling up, we'd return
         //       here recursively - prevent that
@@ -5649,6 +5695,10 @@ static void OnTimer(MainWindow* win, HWND hwnd, WPARAM timerId) {
             MainWindowRerender(win);
             break;
 
+        case kAnnotationNudgeTimerID:
+            FinishAnnotationNudge(win);
+            break;
+
         case kTouchLongPressTimerID: {
             KillTimer(hwnd, kTouchLongPressTimerID);
             if (win->touchState.panDidScroll || win->touchState.longPressFired) {
@@ -5784,12 +5834,10 @@ static void OnTimer(MainWindow* win, HWND hwnd, WPARAM timerId) {
                     // reloadOnFocus set or a later tab focus would reload
                     tab->ignoreNextAutoReload = false;
                     tab->reloadOnFocus = false;
-                } else if (IsThreadInMenuMode()) {
+                } else if (IsThreadInMenuMode() || AutoReloadFileStillChanging(tab)) {
                     // an open menu's nested loop dispatches this timer while
                     // OnWindowContextMenu still holds the controller, engine and
-                    // page element it cached: reload once the menu is gone
-                    SetTimer(hwnd, kAutoReloadTimerID, kAutoReloadDelayInMs, nullptr);
-                } else if (AutoReloadFileStillChanging(tab)) {
+                    // page element it cached: reload once the menu is gone.
                     // a writer (LaTeX etc.) is still producing the file: reloading
                     // now shows a half-written document ("cannot find startxref",
                     // "document has no pages") and costs a second reload once the
@@ -6308,14 +6356,17 @@ LRESULT CALLBACK WndProcCanvas(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
     }
 
+    // the frame forwards the wheel here and DefWindowProc would hand it back to
+    // the frame: recursion until the stack overflows
+    bool isWheel = msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL;
     if (!win) {
-        return DefWindowProc(hwnd, msg, wp, lp);
+        return isWheel ? 0 : DefWindowProc(hwnd, msg, wp, lp);
     }
 
     // Window close deletes controllers while DestroyWindow (WebView2, etc.) can
     // still deliver canvas messages; don't touch win->ctrl after that starts.
     if (win->isBeingClosed) {
-        return DefWindowProc(hwnd, msg, wp, lp);
+        return isWheel ? 0 : DefWindowProc(hwnd, msg, wp, lp);
     }
 
     // reveal/hide the floating overlay toolbar as the mouse approaches the top;

@@ -11,8 +11,10 @@
 #include "base/GdiPlusUtil.h"
 
 #include "gui/UIModels.h"
+#include "gui/Layout.h"
 #include "gui/Gfx.h"
 #include "gui/PlatformFont.h"
+#include "gui/VirtCtrl.h"
 
 #include "Settings.h"
 #include "AppSettings.h"
@@ -49,6 +51,8 @@
 #include "ReadAloud.h"
 #include "ReadingAutoScroll.h"
 #include "ReadingBar.h"
+#include "TableOfContents.h"
+#include "SidebarPanel.h"
 #include "Menu.h"
 
 // value associated with menu item for owner-drawn purposes
@@ -314,6 +318,10 @@ static MenuDef menuDefView[] = {
     {
         TrN("Show Book&marks"),
         CmdToggleBookmarks,
+    },
+    {
+        TrN("Sho&w Thumbnails"),
+        CmdToggleThumbnails,
     },
     {
         TrN("Show Me&nu"),
@@ -1223,6 +1231,10 @@ static MenuDef menuDefDocumentOperations[] = {
         CmdPdfDeletePages,
     },
     {
+        TrN("Merge PDF..."),
+        CmdMergePDF,
+    },
+    {
         TrN("Extract Text From Document"),
         CmdDocumentExtractText,
     },
@@ -1323,6 +1335,10 @@ static MenuDef menuDefContext[] = {
     {
         TrN("Show &Bookmarks"),
         CmdToggleBookmarks,
+    },
+    {
+        TrN("Show &Thumbnails"),
+        CmdToggleThumbnails,
     },
     {
         TrN("Sh&ow Toolbar"),
@@ -1577,9 +1593,7 @@ static void AppendExternalViewersToMenu(HMENU menuFile, Str filePath) {
         if (str::IsEmptyOrWhiteSpace(cmd->name)) {
             if (str::IsEmptyOrWhiteSpace(name)) {
                 StrNode* args = ParseCmdLine(ToWStrTemp(commandLine));
-                defer {
-                    FreeStrNode(nullptr, args);
-                };
+                AutoFreeStrNode freeArgs(args);
                 StrNode* arg0 = args;
                 for (int i = 0; arg0 && i < 2; i++) {
                     arg0 = arg0->next;
@@ -2101,10 +2115,13 @@ static void MenuUpdateStateForWindow(MainWindow* win) {
     MenuSetEnabled(win->menu, CmdToggleBookmarks, enabled);
 
     bool documentSpecific = win->IsDocLoaded();
-    bool checked = documentSpecific ? win->uiState.tocVisible : gSettings->showToc;
+    bool bookmarksShown = IsSidebarViewShown(win, SidebarView::Bookmarks);
+    bool checked = documentSpecific ? bookmarksShown : gSettings->showToc;
     MenuSetChecked(win->menu, CmdToggleBookmarks, checked);
+    MenuSetEnabled(win->menu, CmdToggleThumbnails, CanShowThumbnails(tab));
+    MenuSetChecked(win->menu, CmdToggleThumbnails, IsSidebarViewShown(win, SidebarView::Thumbnails));
 
-    MenuSetChecked(win->menu, CmdFavoriteToggle, gSettings->showFavorites);
+    MenuSetChecked(win->menu, CmdFavoriteToggle, IsSidebarViewShown(win, SidebarView::Favorites));
     MenuSetChecked(win->menu, CmdFavoriteShowInTab, FindFavoritesTab(win) != nullptr);
     {
         // checked when mode is not "hide" (show or overlay)
@@ -2416,10 +2433,12 @@ void OnWindowContextMenu(MainWindow* win, int x, int y) {
 
     MenuUpdatePrintItem(win, popup, true);
     MenuSetEnabled(popup, CmdToggleBookmarks, win->ctrl->HasToc());
-    MenuSetChecked(popup, CmdToggleBookmarks, win->uiState.tocVisible);
+    MenuSetChecked(popup, CmdToggleBookmarks, IsSidebarViewShown(win, SidebarView::Bookmarks));
+    MenuSetEnabled(popup, CmdToggleThumbnails, CanShowThumbnails(tab));
+    MenuSetChecked(popup, CmdToggleThumbnails, IsSidebarViewShown(win, SidebarView::Thumbnails));
 
     MenuSetEnabled(popup, CmdFavoriteToggle, HasFavorites());
-    MenuSetChecked(popup, CmdFavoriteToggle, gSettings->showFavorites);
+    MenuSetChecked(popup, CmdFavoriteToggle, IsSidebarViewShown(win, SidebarView::Favorites));
     MenuSetEnabled(popup, CmdFavoriteShowInTab, HasFavorites() && SettingsUseTabs());
     MenuSetChecked(popup, CmdFavoriteShowInTab, FindFavoritesTab(win) != nullptr);
 

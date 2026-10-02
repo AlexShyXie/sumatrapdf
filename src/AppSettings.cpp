@@ -15,7 +15,6 @@
 
 #include "gui/UIModels.h"
 
-#define INCLUDE_SETTINGSSTRUCTS_METADATA
 #include "Settings.h"
 #include "Commands.h"
 #include "DisplayMode.h"
@@ -437,6 +436,7 @@ TabState* CloneTabState(const TabState* src) {
     dst->rotation = src->rotation;
     dst->scrollPos = src->scrollPos;
     dst->showToc = src->showToc;
+    str::ReplaceWithCopy(&dst->sidebarView, src->sidebarView);
     dst->tocState = new Vec<int>(*src->tocState);
     return dst;
 }
@@ -565,6 +565,7 @@ static void RememberSessionState() {
             FileState* fs = NewFileState(fp);
             tab->ctrl->GetDisplayState(fs);
             fs->showToc = tab->showToc;
+            str::ReplaceWithCopy(&fs->sidebarView, SidebarViewToStr(tab->sidebarView));
             *fs->tocState = tab->tocState;
             TabState* ts = NewTabState(fs);
             VecAppend(*windowState->tabStates, ts);
@@ -1786,6 +1787,7 @@ TabState* NewTabState(FileState* fs) {
     state->rotation = fs->rotation;
     state->scrollPos = fs->scrollPos;
     state->showToc = fs->showToc;
+    str::ReplaceWithCopy(&state->sidebarView, fs->sidebarView);
     *state->tocState = *fs->tocState;
     return state;
 }

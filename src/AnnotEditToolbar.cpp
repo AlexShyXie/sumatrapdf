@@ -882,9 +882,8 @@ static fz_path* ParseMupdfIconPath(fz_context* ctx, const char* s) {
                 float b = PdfPathPop(stk, top);
                 float a = PdfPathPop(stk, top);
                 ctm = fz_concat(fz_make_matrix(a, b, c, d, e, f), ctm);
-            } else if (nOp == 1 && op[0] == 'f') {
-                top = 0;
             } else {
+                // 'f' and unknown ops: drop the operands, keep the path
                 top = 0;
             }
         }
@@ -1036,18 +1035,12 @@ static void PaintMupdfAnnotIcon(Gfx* gfx, Rect r, Str name, Color fg, PlatformFo
     gfx->DrawText(label, r, gfxTextCenter | gfxTextVCenter | gfxTextEllipsis, font, fg);
 }
 
+// a stamp has no glyph: its name, the chip is sized to fit it
 static void PaintIconGlyph(Gfx* gfx, Rect r, Str name, Color col, PlatformFont* font) {
     if (len(name) == 0) {
         return;
     }
-    int pad = DpiScale(4);
-    Rect inner = r;
-    inner.Inflate(-pad, -pad);
-    Str label = name;
-    if (len(label) > 2) {
-        label = Str(name.s, 2);
-    }
-    gfx->DrawText(label, inner, gfxTextCenter | gfxTextVCenter | gfxTextEllipsis, font, col);
+    gfx->DrawText(name, r, gfxTextCenter | gfxTextVCenter | gfxTextEllipsis, font, col);
 }
 
 static Color BarActiveBg() {
@@ -1716,7 +1709,6 @@ static Size ChipSizeFor(const AnnotEditItem& item, PlatformFont* font, int rowDy
         case AnnotEditKind::InteriorColor:
         case AnnotEditKind::TextColor:
         case AnnotEditKind::Alignment:
-        case AnnotEditKind::Icon:
         case AnnotEditKind::Bold:
         case AnnotEditKind::Italic:
         case AnnotEditKind::Underline:
@@ -1728,6 +1720,13 @@ static Size ChipSizeFor(const AnnotEditItem& item, PlatformFont* font, int rowDy
         case AnnotEditKind::LineStart:
         case AnnotEditKind::LineEnd:
             return {rowDy * 2, rowDy};
+        case AnnotEditKind::Icon: {
+            if (item.mupdfIcon) {
+                return {rowDy, rowDy};
+            }
+            Size text = PlatformFontMeasureText(font, item.iconName);
+            return {std::max(rowDy, text.dx + (2 * padX)), rowDy};
+        }
         default: {
             Str label = ChipLabelTemp(item);
             Size text = PlatformFontMeasureText(font, label ? label : StrL("00"));
@@ -2570,7 +2569,7 @@ bool StartFreeTextInPlaceEdit(MainWindow* win, Annotation* annot) {
         textSize = 12;
     }
     int borderWidth = std::max(BorderWidth(annot), 0);
-    int fontPx = std::max(6, (int)(((float)textSize * scale) + 0.5f));
+    int fontPx = std::max(6, (int)lroundf((float)textSize * scale));
     int fontStyle = FreeTextFontStyle(annot);
     int weight = (fontStyle & kFreeTextBold) ? FW_BOLD : FW_NORMAL;
     BOOL italic = (fontStyle & kFreeTextItalic) ? TRUE : FALSE;

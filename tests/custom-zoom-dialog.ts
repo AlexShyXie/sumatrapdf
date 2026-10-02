@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { ControlClient, ControlCommand, withControlledSumatra } from "./control.ts";
 import { EXE, ROOT, cmdId, runStandalone, SLOW_BUILD_FACTOR, writeAppdata } from "./util.ts";
 import {
+  ensureModifierKeysUp,
   enumWindows,
   findChildWindow,
   getClassName,
@@ -95,11 +96,12 @@ async function waitForDialogGone(pid: number, frame: number): Promise<void> {
 }
 
 // a key the dialog's own handler sees: it reads them off the message queue of
-// whatever has the focus, which is the edit field
+// whatever has the focus, which is the edit field. A Ctrl stuck down mid-run
+// (RDP) makes it ignore Enter, so release modifiers first
 async function pressKey(hwnd: number, vkey: number): Promise<void> {
+  await ensureModifierKeysUp();
   postMessage(hwnd, WM_KEYDOWN, vkey, 0);
   postMessage(hwnd, WM_KEYUP, vkey, 0);
-  await sleep(150 * SLOW_BUILD_FACTOR);
 }
 
 async function editText(edit: number, want: string, what: string): Promise<void> {
@@ -123,7 +125,13 @@ async function walk(edit: number, vkey: number): Promise<string[]> {
   const seen: string[] = [getControlText(edit)];
   for (let i = 0; i < 40; i++) {
     await pressKey(edit, vkey);
-    const now = getControlText(edit);
+    const before = seen[seen.length - 1]!;
+    const deadline = Date.now() + 250 * SLOW_BUILD_FACTOR;
+    let now = before;
+    while (now === before && Date.now() < deadline) {
+      await sleep(10);
+      now = getControlText(edit);
+    }
     if (now === seen[seen.length - 1]) {
       // the end of the list: it stops there rather than wrapping round
       return seen;

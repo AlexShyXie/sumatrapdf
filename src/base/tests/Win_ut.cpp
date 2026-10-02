@@ -19,9 +19,7 @@ static void QuoteCmdLineArgTest() {
         // ParseCmdLine uses CommandLineToArgvW; prefix a dummy argv[0].
         TempStr cmdLine = fmt("exe %s", quoted);
         StrNode* args = ParseCmdLine(cmdLine);
-        defer {
-            FreeStrNode(nullptr, args);
-        };
+        AutoFreeStrNode freeArgs(args);
         utassert(args != nullptr);
         utassert(str::Eq(args->s, StrL("exe")));
         if (len(input) == 0) {
@@ -75,8 +73,8 @@ static void FillLinkAaPixels(u8* p, int bpp) {
     p[bpp + 2] = 0;
     // ~50% coverage (R/G halfway to paper)
     p[2 * bpp] = 255;
-    p[2 * bpp + 1] = 128;
-    p[2 * bpp + 2] = 128;
+    p[(2 * bpp) + 1] = 128;
+    p[(2 * bpp) + 2] = 128;
 }
 
 static void CheckLinkAaPixels(u8* p, int bpp) {
@@ -93,8 +91,8 @@ static void CheckLinkAaPixels(u8* p, int bpp) {
     utassert(p[bpp] == lb && p[bpp + 1] == lg && p[bpp + 2] == lr);
     // fringe interpolates toward background, not snapped to link
     utassert(p[2 * bpp] == RecolorLerp(lb, bb, 128));
-    utassert(p[2 * bpp + 1] == RecolorLerp(lg, bgc, 128));
-    utassert(p[2 * bpp + 2] == RecolorLerp(lr, br, 128));
+    utassert(p[(2 * bpp) + 1] == RecolorLerp(lg, bgc, 128));
+    utassert(p[(2 * bpp) + 2] == RecolorLerp(lr, br, 128));
 }
 
 static void RecolorLinkAaTest() {
@@ -142,7 +140,7 @@ static HICON MakeMaskedRedIcon() {
     memset(maskBits, 0xFF, sizeof(maskBits));
     for (int y = 4; y < 12; y++) {
         maskBits[y * 2] = 0xF0;
-        maskBits[y * 2 + 1] = 0x0F;
+        maskBits[(y * 2) + 1] = 0x0F;
     }
     HBITMAP hbmMask = CreateBitmap(n, n, 1, 1, maskBits);
     if (!hbmMask) {
@@ -164,12 +162,12 @@ static HICON MakeMaskedRedIcon() {
 static void FillBlitPattern(Pixmap* p) {
     for (int y = 0; y < p->height; y++) {
         u8* d = p->data + ((size_t)y * p->stride);
-        u8 v = (u8)(40 + (y % 17) * 7);
+        u8 v = (u8)(40 + ((y % 17) * 7));
         int bpp = PixmapBytesPerPixel(p->format);
         for (int x = 0; x < p->width; x++, d += bpp) {
             d[0] = v;
             d[1] = (u8)(v + (x % 3));
-            d[2] = (u8)(200 - (y % 17) * 5);
+            d[2] = (u8)(200 - ((y % 17) * 5));
             if (bpp == 4) {
                 d[3] = 255;
             }
@@ -363,6 +361,73 @@ static void PixmapToBgraTest() {
     utassert(PixmapToBgra(nullptr) == nullptr);
 }
 
+static Pixmap* MakeFilledPixmap(int w, int h, PixmapFormat fmt, const u8 px[4]) {
+    Pixmap* p = AllocPixmap(w, h, fmt);
+    utassert(p);
+    int bpp = PixmapBytesPerPixel(fmt);
+    for (int y = 0; y < h; y++) {
+        u8* d = p->data + ((size_t)y * p->stride);
+        for (int x = 0; x < w; x++, d += bpp) {
+            memcpy(d, px, bpp);
+        }
+    }
+    return p;
+}
+
+static void AssertAllBgr(const Pixmap* p, u8 b, u8 g, u8 r) {
+    utassert(p && p->data && p->format == PixmapFormat::BGR8);
+    for (int y = 0; y < p->height; y++) {
+        const u8* d = p->data + ((size_t)y * p->stride);
+        for (int x = 0; x < p->width; x++, d += 3) {
+            utassert(d[0] == b && d[1] == g && d[2] == r);
+        }
+    }
+}
+
+// PixmapToBgr: 32bpp pixels become opaque 24bpp (transparency over white);
+// BGR8 and palette DIBs are returned as is
+static void PixmapToBgrTest() {
+    const int w = 5;
+    const int h = 3;
+    const u8 opaque[4] = {10, 20, 30, 0};
+    Pixmap* got = PixmapToBgr(MakeFilledPixmap(w, h, PixmapFormat::BGRA8, opaque));
+    AssertAllBgr(got, 10, 20, 30);
+    utassert(got->width == w && got->height == h && got->stride == 16);
+    FreePixmap(got);
+
+    // straight alpha: red at half opacity over white
+    const u8 halfRed[4] = {0, 0, 255, 128};
+    Pixmap* src = MakeFilledPixmap(w, h, PixmapFormat::BGRA8, halfRed);
+    src->hasAlpha = true;
+    got = PixmapToBgr(src);
+    AssertAllBgr(got, 127, 127, 255);
+    FreePixmap(got);
+
+    // premultiplied alpha: same color, already scaled by alpha
+    const u8 halfRedPremul[4] = {0, 0, 128, 128};
+    src = MakeFilledPixmap(w, h, PixmapFormat::BGRA8, halfRedPremul);
+    src->hasAlpha = true;
+    src->premultiplied = true;
+    got = PixmapToBgr(src);
+    AssertAllBgr(got, 127, 127, 255);
+    FreePixmap(got);
+
+    const u8 rgba[4] = {30, 20, 10, 255};
+    got = PixmapToBgr(MakeFilledPixmap(w, h, PixmapFormat::RGBA8, rgba));
+    AssertAllBgr(got, 10, 20, 30);
+    FreePixmap(got);
+
+    Pixmap* bgr = AllocPixmap(w, h, PixmapFormat::BGR8);
+    utassert(PixmapToBgr(bgr) == bgr);
+    FreePixmap(bgr);
+
+    Pixmap* palette = MakePaletteDib(w, h);
+    utassert(PixmapToBgr(palette) == palette);
+    FreePixmap(palette);
+
+    utassert(PixmapToBgr(nullptr) == nullptr);
+}
+
 void WinUtilTest() {
     AutoCoUninitialize comScope;
 
@@ -372,6 +437,7 @@ void WinUtilTest() {
     BlitPixmapExactTest();
     BlitPaletteDibTest();
     PixmapToBgraTest();
+    PixmapToBgrTest();
 
     {
         Str string = StrL("abcde");

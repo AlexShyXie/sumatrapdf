@@ -13,6 +13,7 @@
 
 #include "gui/PlatformFont.h"
 #include "gui/Gfx.h"
+#include "gui/GuiColors.h"
 #include "gui/VirtCtrl.h"
 
 #include "Settings.h"
@@ -34,9 +35,9 @@
 #include "Accelerators.h"
 #include "Theme.h"
 #include "FilterHighlightDraw.h"
+#include "PageThumbnails.h"
+#include "SidebarPanel.h"
 #include "TableOfContents.h"
-
-static void LayoutTocContainer(MainWindow* win);
 
 // When true, multi-highlight every TOC item that matches the current page
 // (issue #4642). Easy to flip for comparison with single-selection behavior.
@@ -418,20 +419,6 @@ void ClearTocBox(MainWindow* win) {
     win->currPageNo = 0;
 }
 
-void ToggleTocBox(MainWindow* win) {
-    if (!win->IsDocLoaded()) {
-        return;
-    }
-    if (win->uiState.tocVisible) {
-        SetSidebarVisibility(win, false, gSettings->showFavorites, SidebarResizeFrame::Adjust);
-        return;
-    }
-    SetSidebarVisibility(win, true, gSettings->showFavorites, SidebarResizeFrame::Adjust);
-    if (win->uiState.tocVisible) {
-        HwndSetFocus(win->tocTreeView->hwnd);
-    }
-}
-
 struct VistorForPageNoData {
     int pageNo = -1;
 
@@ -622,8 +609,11 @@ static TocItem* FindVisibleParentTreeItem(TreeView* treeView, TocItem* ti) {
 }
 
 void UpdateTocSelection(MainWindow* win, int currPageNo) {
+    if (win->pageThumbs && win->pageThumbs->active) {
+        win->pageThumbs->SetCurrentPage(currPageNo);
+    }
     auto* treeView = win->tocTreeView;
-    if (!win->tocLoaded || !win->uiState.tocVisible || !treeView) {
+    if (!win->tocLoaded || !IsSidebarViewShown(win, SidebarView::Bookmarks) || !treeView) {
         return;
     }
 
@@ -667,11 +657,9 @@ void ExpandTocToCurrentPage(MainWindow* win) {
     if (!win || !win->IsDocLoaded()) {
         return;
     }
-    // make sure the bookmarks (table of contents) sidebar is visible
-    if (!win->uiState.tocVisible) {
-        SetSidebarVisibility(win, true, gSettings->showFavorites);
-    }
-    if (!win->tocLoaded || !win->uiState.tocVisible) {
+    // make sure the bookmarks (table of contents) are showing
+    ShowSidebarView(win, SidebarView::Bookmarks);
+    if (!win->tocLoaded || !IsSidebarViewShown(win, SidebarView::Bookmarks)) {
         return;
     }
     TreeView* treeView = win->tocTreeView;
@@ -1205,7 +1193,9 @@ void LoadTocTree(MainWindow* win) {
 
     treeView->onCustomDraw = MkFunc1Void(OnTocCustomDraw);
     treeView->SetTreeModel(tocTree);
-    LayoutTocContainer(win);
+    if (SidebarPanel* p = SidebarPanelShowing(win, SidebarView::Bookmarks)) {
+        RelayoutSidebarPanel(p);
+    }
 }
 
 // TreeView items inserted while the sidebar is hidden or 0-sized stay blank
@@ -1218,8 +1208,8 @@ void RefreshTocTreeIfNeeded(MainWindow* win) {
     if (!tab || !tab->currToc || !tab->currToc->root) {
         return;
     }
-    Rect rc = HwndClientRect(win->hwndTocBox);
-    if (rc.IsEmpty() || !HwndIsVisible(win->hwndTocBox)) {
+    SidebarPanel* p = SidebarPanelShowing(win, SidebarView::Bookmarks);
+    if (!p || HwndClientRect(p->hwnd).IsEmpty() || !HwndIsVisible(p->hwnd)) {
         return;
     }
     win->tocTreeView->SetTreeModel(tab->currToc);
@@ -1639,73 +1629,6 @@ void TocTreeKeyDown2(TreeView::KeyDownEvent* ev) {
     ev->result = 1;
 }
 
-// Position label, filter edit, and tree window within toc container using the
-// wingui layout engine (VBox built in CreateToc).
-static void LayoutTocContainer(MainWindow* win) {
-    if (!win->tocLayout) {
-        return;
-    }
-    Rect rc = HwndClientRect(win->hwndTocBox);
-    if (rc.IsEmpty()) {
-        return;
-    }
-    bool firstLayout = win->tocLayout->lastBounds.IsEmpty();
-    if (win->tocLayout->lastBounds.dx != rc.dx || win->tocLayout->lastBounds.dy != rc.dy) {
-        LayoutTreeToSize(win->hwndTocBox, win->tocLayout, {rc.dx, rc.dy}, &win->tocRoot);
-    }
-    if (firstLayout) {
-        RefreshTocTreeIfNeeded(win);
-    }
-}
-
-static LRESULT CALLBACK WndProcTocBox(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR /*subclassId*/,
-                                      DWORD_PTR /*data*/) {
-    MainWindow* win = FindMainWindowByHwnd(hwnd);
-    if (!win) {
-        return DefSubclassProc(hwnd, msg, wp, lp);
-    }
-
-    LRESULT res = 0;
-    res = TryReflectMessages(hwnd, msg, wp, lp);
-    if (res) {
-        return res;
-    }
-
-    // the panel header (label + close button) is a virtual control tree, so
-    // this window paints it and hands it its input
-    if (VirtHostOnMessage(hwnd, win->tocRoot, msg, wp, lp, res, ThemeControlBackgroundColor())) {
-        return res;
-    }
-
-    switch (msg) {
-        case WM_SIZE:
-            LayoutTocContainer(win);
-            break;
-    }
-    return DefSubclassProc(hwnd, msg, wp, lp);
-}
-
-static void SubclassToc(MainWindow* win) {
-    HWND hwndTocBox = win->hwndTocBox;
-
-    if (win->tocBoxSubclassId == 0) {
-        win->tocBoxSubclassId = NextSubclassId();
-        BOOL ok = SetWindowSubclass(hwndTocBox, WndProcTocBox, win->tocBoxSubclassId, (DWORD_PTR)win);
-        if (!ok) {
-            // can fail under low memory / desktop heap exhaustion, so don't assert
-            logf("SubclassToc: SetWindowSubclass() failed, err: %d\n", (int)GetLastError());
-            win->tocBoxSubclassId = 0;
-        }
-    }
-}
-
-void UnsubclassToc(MainWindow* win) {
-    if (win->tocBoxSubclassId != 0) {
-        RemoveWindowSubclass(win->hwndTocBox, WndProcTocBox, win->tocBoxSubclassId);
-        win->tocBoxSubclassId = 0;
-    }
-}
-
 // Append a TocItem linked list onto resultFirst/resultLast (updates last).
 static void AppendTocSiblingList(TocItem*& resultFirst, TocItem*& resultLast, TocItem* list) {
     if (!list) {
@@ -1858,23 +1781,13 @@ static LRESULT CALLBACK WndProcTocFilterEdit(HWND hwnd, UINT msg, WPARAM wp, LPA
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+// The Bookmarks and Thumbnails views; a sidebar panel shows them (SidebarPanel.cpp)
 void CreateToc(MainWindow* win) {
-    HMODULE hmod = GetModuleHandle(nullptr);
-    int dx = gSettings->sidebarDx;
-    DWORD style = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
-    HWND parent = win->hwndFrame;
-    win->hwndTocBox = CreateWindowExW(0, WC_STATIC, L"", style, 0, 0, dx, 0, parent, nullptr, hmod, nullptr);
-
-    PlatformFont* labelFont = GetAppSidebarLabelFont();
-    auto header = NewLabelWithClose(win->hwndTocBox, labelFont, MkFunc0(ToggleTocBox, win));
-    win->tocLabel = header.label;
-    win->tocCloseBtn = header.closeBtn;
-    // label text is set in UpdateToolbarSidebarText()
-
+    HWND parent = win->sidebarTop->hwnd;
     auto* filterEdit = new Edit();
     {
         Edit::CreateArgs eargs;
-        eargs.parent = win->hwndTocBox;
+        eargs.parent = parent;
         eargs.withBorder = true;
         eargs.cueText = Tr("Search Bookmarks");
         eargs.font = GetAppFont();
@@ -1887,7 +1800,7 @@ void CreateToc(MainWindow* win) {
     auto* treeView = new TreeView();
     treeView->lazyChildren = true;
     TreeView::CreateArgs args;
-    args.parent = win->hwndTocBox;
+    args.parent = parent;
     args.font = GetAppTreeFont();
     args.fullRowSelect = true;
     args.exStyle = 0;
@@ -1904,18 +1817,82 @@ void CreateToc(MainWindow* win) {
     ReportIf(!treeView->hwnd);
     win->tocTreeView = treeView;
 
-    // stack label, filter edit and tree vertically; the tree flexes to fill the
-    // remaining height. The VBox owns these controls/spacer (freed in ~MainWindow).
+    // the filter edit over the tree, which takes the remaining height
     auto* vbox = new VBox();
     vbox->alignMain = MainAxisAlign::MainStart;
     vbox->alignCross = CrossAxisAlign::Stretch;
-    vbox->AddChild(header.box);
     vbox->AddChild(filterEdit);
     vbox->AddChild(new Spacer(0, 2)); // gap under the search field
     vbox->AddChild(treeView, 1);
-    win->tocLayout = vbox;
+    win->tocViewLayout = vbox;
 
-    SubclassToc(win);
+    int dpi = DpiGetForHwnd(parent);
+    win->pageThumbs = new PageThumbnailsCtrl(win, GetAppFont(), dpi, ThumbnailsHost::Sidebar);
+    win->pageThumbs->SetIsVisible(false);
 
     UpdateControlsColors(win);
+}
+
+//--- Thumbnails view
+
+bool CanShowThumbnails(WindowTab* tab) {
+    return tab && tab->IsDocLoaded() && tab->AsFixed();
+}
+
+void UpdateSidebarColors(MainWindow* win) {
+    if (!win->pageThumbs) {
+        return;
+    }
+    win->pageThumbs->SetColor(kColListText, ThemeWindowTextColor());
+    win->pageThumbs->SetColor(kColListBg, ThemeControlBackgroundColor());
+    UpdateSidebarPanelsIcons(win);
+}
+
+// the thumbnails render while a sidebar panel shows them
+void UpdateSidebarThumbnails(MainWindow* win) {
+    PageThumbnailsCtrl* thumbs = win->pageThumbs;
+    if (!thumbs) {
+        return;
+    }
+    WindowTab* tab = win->CurrentTab();
+    if (!IsSidebarViewShown(win, SidebarView::Thumbnails) || !CanShowThumbnails(tab)) {
+        thumbs->Deactivate();
+        return;
+    }
+    DisplayModel* dm = tab->AsFixed();
+    if (thumbs->tab != tab || thumbs->dm != dm || thumbs->pageCount != dm->PageCount()) {
+        thumbs->SetTab(tab);
+    }
+    thumbs->Activate();
+}
+
+// Keys the focused thumbnails handle rather than the canvas: Up / Down. The
+// message loop skips accelerators for them
+bool ThumbnailsTakeKey(MainWindow* win, HWND hwnd, WPARAM key) {
+    SidebarPanel* p = win ? SidebarPanelShowing(win, SidebarView::Thumbnails) : nullptr;
+    if (!p || hwnd != p->hwnd || !CanShowThumbnails(win->CurrentTab())) {
+        return false;
+    }
+    if (IsCtrlPressed() || IsAltPressed()) {
+        return false;
+    }
+    return key == VK_UP || key == VK_DOWN;
+}
+
+// The document is going away: the thumbnails let go of it
+void ClearSidebarThumbnails(MainWindow* win) {
+    if (!win->pageThumbs) {
+        return;
+    }
+    win->pageThumbs->Deactivate();
+    win->pageThumbs->SetTab(nullptr);
+}
+
+// pages were moved, inserted or removed: the thumbnails start over
+void SidebarPagesChanged(MainWindow* win) {
+    PageThumbnailsCtrl* thumbs = win->pageThumbs;
+    if (!thumbs || !thumbs->tab || thumbs->tab != win->CurrentTab()) {
+        return;
+    }
+    thumbs->SetTab(thumbs->tab);
 }

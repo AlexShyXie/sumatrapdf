@@ -32,10 +32,19 @@ import {
   MK_RBUTTON,
   WM_COMMAND,
   WM_MOUSEMOVE,
+  WM_MOUSELEAVE,
   WM_RBUTTONDOWN,
   WM_RBUTTONUP,
 } from "./winapi.ts";
-import { clickAt, findChildByClass, killAndWait, launchControlled, sendCommand } from "./win-automation.ts";
+import {
+  clickAt,
+  findChildByClass,
+  killAndWait,
+  launchControlled,
+  parkCursorAway,
+  sendCommand,
+  sendCommandSync,
+} from "./win-automation.ts";
 
 const TOOLBAR_CLASS = "SUMATRA_VIRT_TOOLBAR";
 const MENU_CLASS = "SumatraToolbarHoverMenu";
@@ -191,6 +200,48 @@ async function waitMenu(pid: number, want: boolean, what: string): Promise<numbe
       throw new Error(`toolbar-hover-dropdown: ${what}`);
     }
     await sleep(50);
+  }
+}
+
+function menuShowing(pid: number): number {
+  const h = findTopWindow(pid, MENU_CLASS);
+  return h !== 0 && isWindowVisible(h) ? h : 0;
+}
+
+// A hwnd read before an await can already be a different drop-down: the cursor
+// gets yanked, the 150ms timer closes it, and resting on the button opens
+// another. Click only when the row and the window are still the one just read.
+async function clickMenuItem(client: ControlClient, pid: number, cmd: number, what: string): Promise<void> {
+  const deadline = Date.now() + 6000 * SLOW_BUILD_FACTOR;
+  let detail = "";
+  let clicked = false;
+  for (;;) {
+    const h = menuShowing(pid);
+    if (clicked && h === 0) {
+      return;
+    }
+    if (h === 0) {
+      detail = "closed before the click";
+    } else {
+      const it = (await dropdownItems(client)).find((x) => x.cmd === cmd);
+      if (!it) {
+        detail = "row not in the drop-down";
+      } else if (menuShowing(pid) === h) {
+        const r = getWindowRect(h);
+        const x = Math.floor((it.x + it.x2) / 2) - r.left;
+        const y = Math.floor((it.y + it.y2) / 2) - r.top;
+        await clickAt(h, x, y, 0);
+        clicked = true;
+        detail = `${it.text} @${x},${y}`;
+        if (menuShowing(pid) === 0) {
+          return;
+        }
+      }
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`toolbar-hover-dropdown: ${what} (${detail})`);
+    }
+    await sleep(40);
   }
 }
 
@@ -385,8 +436,40 @@ function checkCurrentBoxed(items: Item[], want: string): void {
   if (current.length !== 1 || current[0]!.text !== want) {
     throw new Error(
       `toolbar-hover-dropdown: want only ${want} marked as the current zoom, got ` +
-        `[${current.map((it) => it.text).join()}]`,
+        `[${current.map((it) => it.text).join()}] of [${items.map((it) => it.text).join()}]`,
     );
+  }
+}
+
+// The close timer is 150ms and it reads the real cursor. Hold the cursor on
+// the button and re-read until the level is boxed: one read after a sleep
+// sees an empty strip when the cursor was yanked off.
+async function waitCurrentZoom(
+  client: ControlClient,
+  toolbar: number,
+  pid: number,
+  x: number,
+  y: number,
+  want: string,
+): Promise<{ menu: number; items: Item[] }> {
+  const deadline = Date.now() + 4000 * SLOW_BUILD_FACTOR;
+  let last: Item[] = [];
+  for (;;) {
+    hoverToolbar(toolbar, x, y);
+    const menu = menuShowing(pid);
+    if (menu !== 0) {
+      last = await dropdownItems(client);
+      const current = last.filter((it) => it.current);
+      if (current.length === 1 && current[0]!.text === want && menuShowing(pid) === menu) {
+        hoverToolbar(toolbar, x, y);
+        return { menu, items: last };
+      }
+    }
+    if (Date.now() > deadline) {
+      checkCurrentBoxed(last, want);
+      throw new Error(`toolbar-hover-dropdown: want only ${want} marked as the current zoom`);
+    }
+    await sleep(40);
   }
 }
 
@@ -445,7 +528,8 @@ async function checkCustomZoomLevels(dir: string, pdf: string): Promise<void> {
     }
     const zx = zoomIn.x + Math.floor(zoomIn.dx / 2);
     const zy = zoomIn.y + Math.floor(zoomIn.dy / 2);
-    await hoverUntilMenu(toolbar, proc.pid!, zx, zy, "resting on Zoom In did not open the drop-down");
+    rightClickToolbar(toolbar, zx, zy);
+    await waitMenu(proc.pid!, true, "right-clicking Zoom In did not open the custom drop-down");
     await sleep(200);
     const items = await dropdownItems(client);
     if (items.map((it) => it.text).join() !== CUSTOM_ZOOM_STRIP.join()) {
@@ -471,7 +555,7 @@ async function checkCustomZoomLevels(dir: string, pdf: string): Promise<void> {
       menu,
       Math.floor((cell150.x + cell150.x2) / 2) - r.left,
       Math.floor((cell150.y + cell150.y2) / 2) - r.top,
-      300,
+      0,
     );
     await waitZoom(client, "150", "clicking a custom level did not zoom to it");
   } finally {
@@ -509,8 +593,7 @@ export async function testit(): Promise<void> {
     await client.waitForRenderIdle();
     await client.setNotificationsEnabled(false);
     const pid = proc.pid!;
-    sendCommand(frame, cmdId("CmdToggleEditPDF"));
-    await sleep(300);
+    sendCommandSync(frame, cmdId("CmdToggleEditPDF"));
 
     const save = await waitAnnotButton(client, cmdId("CmdSaveAnnotations"), "no Save button on the Edit PDF toolbar");
     if ((await annotButtons(client)).some((b) => b.cmd === cmdId("CmdSaveAnnotationsNewFile"))) {
@@ -560,24 +643,48 @@ export async function testit(): Promise<void> {
 
     // the third row is Discard changes: clicking it runs that command, which
     // proves there are three rows and that a click reaches the right one
-    const rowDy = Math.floor(dy / 3);
-    const rowY = 2 * rowDy + Math.floor(rowDy / 2);
-    // a row lights up under the mouse
-    setCursorPos(mr.left + 40, mr.top + rowY);
-    sendMessage(menu, WM_MOUSEMOVE, 0, packCoords(40, rowY));
-    await clickAt(menu, 20, rowY, 300);
-    await waitMenu(pid, false, "clicking a row did not close the drop-down");
+    const discard = cmdId("CmdDiscardChanges");
+    const saveRows = await dropdownItems(client);
+    if (saveRows.length !== 3 || saveRows[2]!.cmd !== discard) {
+      throw new Error(
+        `toolbar-hover-dropdown: expected Discard changes on the third row, got [${saveRows.map((it) => it.text).join(" | ")}]`,
+      );
+    }
+    await clickMenuItem(client, pid, discard, "clicking a row did not close the drop-down");
     await waitAnnotCount(client, 1, "the third row did not discard the changes");
     if (!(await annotTip(client, cmdId("CmdSaveAnnotations")))) {
       throw new Error("toolbar-hover-dropdown: the button did not get its tooltip back");
     }
 
-    // moving the mouse off it closes it too
+    // moving the mouse off it closes it too. A move message at a toolbar point
+    // can hit another button and leave that button's drop-down up; a leave
+    // follows the real cursor, which has to be off the frame.
     await hoverUntilMenu(toolbar, pid, cx, cy, "the drop-down did not open a second time");
-    const away = clientToScreen(toolbar, 4, 4);
-    setCursorPos(away.x, away.y - 200);
-    sendMessage(toolbar, WM_MOUSEMOVE, 0, packCoords(4, 4));
-    await waitMenu(pid, false, "moving the mouse away did not close the drop-down");
+    const awayDeadline = Date.now() + 6000 * SLOW_BUILD_FACTOR;
+    for (;;) {
+      const menu = menuShowing(pid);
+      if (menu === 0) {
+        break;
+      }
+      parkCursorAway([getWindowRect(frame), getWindowRect(menu)]);
+      sendMessage(menu, WM_MOUSELEAVE, 0, 0);
+      sendMessage(toolbar, WM_MOUSELEAVE, 0, 0);
+      const sliceEnd = Date.now() + 400;
+      let gone = false;
+      while (Date.now() < sliceEnd) {
+        if (menuShowing(pid) === 0) {
+          gone = true;
+          break;
+        }
+        await sleep(50);
+      }
+      if (gone) {
+        break;
+      }
+      if (Date.now() > awayDeadline) {
+        throw new Error("toolbar-hover-dropdown: moving the mouse away did not close the drop-down");
+      }
+    }
 
     // clicking the Save icon itself must close the drop-down: the three rows
     // end the session, and after a save they no longer apply
@@ -590,8 +697,9 @@ export async function testit(): Promise<void> {
     );
     const sx = save3.x + Math.floor(save3.dx / 2);
     const sy = save3.y + Math.floor(save3.dy / 2);
-    await hoverUntilMenu(toolbar, pid, sx, sy, "resting on Save did not open the drop-down before the icon click");
-    await clickAt(toolbar, sx, sy, 300);
+    rightClickToolbar(toolbar, sx, sy);
+    await waitMenu(pid, true, "right-clicking Save did not open the drop-down before the icon click");
+    await clickAt(toolbar, sx, sy, 0);
     await waitMenu(pid, false, "clicking the Save icon did not close the drop-down");
     const stayClosedUntil = Date.now() + 1500;
     while (Date.now() < stayClosedUntil) {
@@ -676,17 +784,19 @@ export async function testit(): Promise<void> {
       zoomMenu,
       Math.floor((cell300.x + cell300.x2) / 2) - zr.left,
       Math.floor((cell300.y + cell300.y2) / 2) - zr.top,
-      300,
+      0,
     );
     await waitMenu(pid, false, "clicking a zoom level did not close the drop-down");
     await waitZoom(client, "300", "clicking the 300% cell did not zoom to it");
 
     // and now that level is the one boxed. The drop-down itself opens exactly
     // where it did before: it hangs off the button, not off the zoom
-    zoomMenu = await hoverUntilMenu(toolbar, pid, zx, zy, "the zoom drop-down did not open again");
-    await sleep(200);
-    items = await dropdownItems(client);
-    checkCurrentBoxed(items, "300%");
+    {
+      rightClickToolbar(toolbar, zx, zy);
+      const boxed = await waitCurrentZoom(client, toolbar, pid, zx, zy, "300%");
+      zoomMenu = boxed.menu;
+      items = boxed.items;
+    }
     checkCentredOnButton(zoomMenu, btnCentreX);
     if (JSON.stringify(getWindowRect(zoomMenu)) !== zoomMenuRect) {
       throw new Error("toolbar-hover-dropdown: the drop-down opened somewhere else once the zoom had changed");
@@ -708,8 +818,8 @@ export async function testit(): Promise<void> {
     }
 
     // a zoom that is none of them leaves nothing boxed
-    sendCommand(frame, cmdId("CmdZoomFitContent"));
-    await sleep(300 * SLOW_BUILD_FACTOR);
+    sendCommandSync(frame, cmdId("CmdZoomFitContent"));
+    await waitZoom(client, "fit content", "could not set Fit Content zoom");
     boxed = (await dropdownItems(client)).filter((it) => it.current).map((it) => it.text);
     if (boxed.length !== 0) {
       throw new Error(`toolbar-hover-dropdown: a zoom off the list still boxes [${boxed.join()}]`);
@@ -726,13 +836,41 @@ export async function testit(): Promise<void> {
     }
     const ox = zoomOut.x + Math.floor(zoomOut.dx / 2);
     const oy = zoomOut.y + Math.floor(zoomOut.dy / 2);
+    // zoomMenu was captured when the strip opened. The awaits since then are
+    // long enough for a yanked cursor to close that window and open another
+    // in the same place; the cross has to be judged against the one up now.
+    if (menuShowing(pid) !== zoomMenu) {
+      zoomMenu = await hoverUntilMenu(
+        toolbar,
+        pid,
+        zx,
+        zy,
+        "the zoom drop-down was not up before crossing to Zoom Out",
+      );
+    }
     const wasAt = (await dropdownItems(client)).map((it) => `${it.text}@${it.x}`).join();
+    const live = menuShowing(pid);
+    if (live !== 0) {
+      zoomMenu = live;
+    }
     const wasRect = JSON.stringify(getWindowRect(zoomMenu));
-    hoverToolbar(toolbar, ox, oy);
-    await sleep(400 * SLOW_BUILD_FACTOR);
-    const stillUp = findTopWindow(pid, MENU_CLASS);
-    if (stillUp !== zoomMenu || !isWindowVisible(stillUp)) {
-      throw new Error("toolbar-hover-dropdown: moving onto Zoom Out did not keep the same drop-down");
+    // the close timer is 150ms and it reads the real cursor. Keep the cursor
+    // on Zoom Out across that window: one move and a long sleep loses it on a
+    // busy machine, and the strip then closes
+    const deadline = Date.now() + 400 * SLOW_BUILD_FACTOR;
+    let stillUp = 0;
+    for (;;) {
+      hoverToolbar(toolbar, ox, oy);
+      stillUp = findTopWindow(pid, MENU_CLASS);
+      if (stillUp !== zoomMenu || !isWindowVisible(stillUp)) {
+        throw new Error(
+          `toolbar-hover-dropdown: moving onto Zoom Out did not keep the same drop-down (hwnd ${stillUp} vs ${zoomMenu})`,
+        );
+      }
+      if (Date.now() >= deadline) {
+        break;
+      }
+      await sleep(40);
     }
     items = await dropdownItems(client);
     if (

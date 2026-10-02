@@ -3,7 +3,6 @@
 
 void CreateToc(MainWindow*);
 void ClearTocBox(MainWindow*);
-void ToggleTocBox(MainWindow*);
 void LoadTocTree(MainWindow*);
 void RefreshTocTreeIfNeeded(MainWindow*);
 // rebuild the tree view after the controller replaced its TocTree
@@ -11,8 +10,14 @@ void ReloadTocTree(WindowTab*);
 void UpdateTocSelection(MainWindow*, int currPageNo);
 void ExpandTocToCurrentPage(MainWindow*);
 void UpdateTocExpansionState(Vec<int>& tocState, TreeView*, TocTree*);
-void UnsubclassToc(MainWindow*);
 void TocFilterChanged(MainWindow*);
+
+bool CanShowThumbnails(WindowTab*);
+void UpdateSidebarThumbnails(MainWindow*);
+void SidebarPagesChanged(MainWindow*);
+void ClearSidebarThumbnails(MainWindow*);
+void UpdateSidebarColors(MainWindow*);
+bool ThumbnailsTakeKey(MainWindow*, HWND, WPARAM key);
 
 // When true (default), the bookmarks pane highlights every TOC entry that
 // matches the current page (same page number as the best match, plus the

@@ -81,6 +81,9 @@ const user32 = dlopen("user32.dll", {
   GetSubMenu: { args: [FFIType.u64, FFIType.i32], returns: FFIType.u64 },
   GetMenuStringW: { args: [FFIType.u64, FFIType.u32, FFIType.ptr, FFIType.i32, FFIType.u32], returns: FFIType.i32 },
   GetMenuState: { args: [FFIType.u64, FFIType.u32, FFIType.u32], returns: FFIType.u32 },
+  OpenClipboard: { args: [FFIType.ptr], returns: FFIType.bool },
+  CloseClipboard: { args: [], returns: FFIType.bool },
+  GetClipboardData: { args: [FFIType.u32], returns: FFIType.u64 },
 });
 
 // GDI + GDI+ for capturing a window to a PNG (see captureWindowToPng). Capturing
@@ -140,6 +143,10 @@ const shell32 = dlopen("shell32.dll", {
   SHAppBarMessage: { args: [FFIType.u32, FFIType.ptr], returns: FFIType.u64 },
 });
 
+const dwmapi = dlopen("dwmapi.dll", {
+  DwmGetWindowAttribute: { args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+});
+
 const gdiplus = dlopen("gdiplus.dll", {
   GdiplusStartup: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.u32 },
   GdipCreateBitmapFromHBITMAP: { args: [FFIType.u64, FFIType.u64, FFIType.ptr], returns: FFIType.u32 },
@@ -176,6 +183,9 @@ const kernel32 = dlopen("kernel32.dll", {
     returns: FFIType.u64,
   },
   DeleteFileW: { args: [FFIType.ptr], returns: FFIType.bool },
+  GlobalLock: { args: [FFIType.u64], returns: FFIType.ptr },
+  GlobalUnlock: { args: [FFIType.u64], returns: FFIType.bool },
+  GlobalSize: { args: [FFIType.u64], returns: FFIType.u64 },
 });
 
 // Authenticode helpers (mirror src/base/Crypto.cpp GetExecutableSignerTemp / IsPEFileSigned).
@@ -252,6 +262,7 @@ export const WM_KEYDOWN = 0x0100;
 export const WM_KEYUP = 0x0101;
 export const WM_CHAR = 0x0102;
 export const WM_MOUSEMOVE = 0x0200;
+export const WM_MOUSELEAVE = 0x02a3;
 export const WM_LBUTTONDOWN = 0x0201;
 export const WM_LBUTTONUP = 0x0202;
 export const WM_LBUTTONDBLCLK = 0x0203;
@@ -285,6 +296,7 @@ export const VK_RMENU = 0xa5;
 export const VK_RETURN = 0x0d;
 export const VK_ESCAPE = 0x1b;
 export const VK_SPACE = 0x20;
+export const VK_NEXT = 0x22;
 export const VK_END = 0x23;
 export const VK_HOME = 0x24;
 export const VK_LEFT = 0x25;
@@ -704,6 +716,7 @@ export function moveWindow(hwnd: number, x: number, y: number, w: number, h: num
 export const SWP_NOZORDER = 0x0004;
 export const SWP_NOACTIVATE = 0x0010;
 export const SWP_FRAMECHANGED = 0x0020;
+export const SWP_NOSENDCHANGING = 0x0400;
 export const GWL_STYLE = -16;
 export const GWL_EXSTYLE = -20;
 export const WS_MAXIMIZE = 0x01000000;
@@ -887,6 +900,47 @@ export function getWindowText(hwnd: number): string {
   return s;
 }
 
+function readClipboardText(): string | null {
+  const CF_UNICODETEXT = 13;
+  if (!user32.symbols.OpenClipboard(null)) {
+    return null;
+  }
+  try {
+    const data = user32.symbols.GetClipboardData(CF_UNICODETEXT);
+    if (!data) {
+      return "";
+    }
+    const mem = kernel32.symbols.GlobalLock(data);
+    if (!mem) {
+      throw new Error(`GlobalLock failed: ${kernel32.symbols.GetLastError()}`);
+    }
+    try {
+      const size = Number(kernel32.symbols.GlobalSize(data));
+      const text = Buffer.from(toArrayBuffer(mem, 0, size)).toString("utf16le");
+      const end = text.indexOf("\0");
+      return end >= 0 ? text.slice(0, end) : text;
+    } finally {
+      kernel32.symbols.GlobalUnlock(data);
+    }
+  } finally {
+    user32.symbols.CloseClipboard();
+  }
+}
+
+export async function getClipboardText(timeoutMs = 1000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const text = readClipboardText();
+    if (text !== null) {
+      return text;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`OpenClipboard failed: ${kernel32.symbols.GetLastError()}`);
+    }
+    await sleep(10);
+  }
+}
+
 // Text of a control (Edit, Static, ...) in another process. GetWindowTextW only
 // returns the caption of foreign windows, so child controls come back empty --
 // WM_GETTEXT is marshalled across processes by user32 and does work.
@@ -922,6 +976,15 @@ export function getWindowRect(hwnd: number): Rect {
   const buf = new Int32Array(4);
   user32.symbols.GetWindowRect(hwnd, ptr(buf));
   return { left: buf[0], top: buf[1], right: buf[2], bottom: buf[3] };
+}
+
+// the part of the window DWM shows (window rect minus invisible resize borders),
+// in screen coordinates; it's what Alt+PrtScn captures
+export function getExtendedFrameBounds(hwnd: number): Rect {
+  const DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+  const buf = new Int32Array(4);
+  dwmapi.symbols.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ptr(buf), buf.byteLength);
+  return { left: buf[0]!, top: buf[1]!, right: buf[2]!, bottom: buf[3]! };
 }
 
 // A hidden window keeps its last rect, so getWindowRect can't tell you whether a
@@ -1122,8 +1185,13 @@ export function readWindowDCRow(hwnd: number, x: number, y: number, count: numbe
 // them back as BGRA bytes (4 per pixel, top-down). Unlike GetPixel on a window
 // DC this works for occluded / background windows, and unlike captureWindowToPng
 // it needs no PNG decoder to assert on what was painted.
-export function captureWindowPixels(hwnd: number): { w: number; h: number; data: Uint8Array } | null {
-  const rc = getClientRect(hwnd);
+// "window" includes the non-client area, even parts off the screen (a
+// maximized window's borders hang over the monitor's edges).
+export function captureWindowPixels(
+  hwnd: number,
+  area: "client" | "window" = "client",
+): { w: number; h: number; data: Uint8Array } | null {
+  const rc = area === "client" ? getClientRect(hwnd) : getWindowRect(hwnd);
   const w = rc.right - rc.left;
   const h = rc.bottom - rc.top;
   if (w <= 0 || h <= 0) {
@@ -1148,7 +1216,8 @@ export function captureWindowPixels(hwnd: number): { w: number; h: number; data:
     return null;
   }
   const oldObj = gdi32.symbols.SelectObject(memDC, bmp);
-  user32.symbols.PrintWindow(hwnd, memDC, PW_CLIENTONLY | PW_RENDERFULLCONTENT);
+  const flags = area === "client" ? PW_CLIENTONLY | PW_RENDERFULLCONTENT : PW_RENDERFULLCONTENT;
+  user32.symbols.PrintWindow(hwnd, memDC, flags);
   gdi32.symbols.SelectObject(memDC, oldObj);
 
   // bun wants the pointer as a number, not the bigint CreateDIBSection wrote

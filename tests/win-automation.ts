@@ -168,6 +168,8 @@ export async function launchControlled(
     if (!path || path.startsWith("-")) {
       throw new Error("shared controlled session needs a document path as its last argument");
     }
+    // Cancel a gesture left by the prior test, or the next click only resets it.
+    sendMessage(sharedSession.frame, WM_KEYDOWN, VK_ESCAPE, 0);
     sendMessage(sharedSession.frame, WM_COMMAND, cmdId("CmdDiscardChanges"), 0);
     sendMessage(sharedSession.frame, WM_COMMAND, cmdId("CmdToggleEditPDF"), 0);
     const command = `[Open("${path}", 0, 1, 0)]`;
@@ -317,6 +319,39 @@ export async function clickAt(hwnd: number, x: number, y: number, settleMs = 350
     console.log(`⚠ clickAt: real mouse moved during the click (to ${at.x},${at.y}, click at ${screen.x},${screen.y})`);
   }
   await sleep(settleMs);
+}
+
+type ScreenRect = { left: number; top: number; right: number; bottom: number };
+
+function rectHasPoint(r: ScreenRect, x: number, y: number): boolean {
+  return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+
+// Moves the real cursor off `avoid` (default: where test windows open), so real
+// mouse moves can't hover the app, e.g. open a toolbar drop-down. SetCursorPos
+// clamps to the screen, so try each side and keep the one that landed outside.
+export function parkCursorAway(avoid?: ScreenRect[]): boolean {
+  if (!avoid) {
+    const p = testWindowPos();
+    avoid = [{ left: p.x, top: p.y, right: p.x + p.dx, bottom: p.y + p.dy }];
+  }
+  const fr = avoid[0]!;
+  const candidates = [
+    { x: fr.left - 40, y: fr.top + 100 },
+    { x: fr.right + 40, y: fr.top + 100 },
+    { x: fr.left + 100, y: fr.bottom + 40 },
+    { x: fr.left + 100, y: fr.top - 40 },
+  ];
+  for (const p of candidates) {
+    if (!setCursorPos(p.x, p.y)) {
+      continue;
+    }
+    const c = getCursorPos();
+    if (!avoid.some((r) => rectHasPoint(r, c.x, c.y))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Press a key (WM_KEYDOWN). Posted (not sent) so it flows through the app's

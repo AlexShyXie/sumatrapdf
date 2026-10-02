@@ -15,6 +15,11 @@ extern "C" {
 #include "Settings.h"
 #include "AppSettings.h"
 #include "gui/UIModels.h"
+#include "gui/Layout.h"
+#include "gui/PlatformFont.h"
+#include "gui/Gfx.h"
+#include "gui/GuiColors.h"
+#include "gui/VirtCtrl.h"
 #include "DocController.h"
 #include "EngineBase.h"
 #include "base/GuessFileType.h"
@@ -38,7 +43,9 @@ extern "C" {
 #include "ReadAloud.h"
 #include "Translations.h"
 #include "MarkdownModel.h"
+#include "PageThumbnails.h"
 #include "TableOfContents.h"
+#include "SidebarPanel.h"
 #include "gui/win/BrowserDocView.h"
 
 #include <chm.h>
@@ -2848,4 +2855,127 @@ TempStr RefHoverResultTemp(Str action, int x, int y, int* exitCodeOut) {
     auto& d = s->displayed;
     return fmt("OK visible=1 hwnd=%d page=%d y=%d zoom=%d", (int)(INT_PTR)s->hwndPopup, d.destPage, (int)d.region.y,
                (int)(d.userZoom * 100));
+}
+
+// The current tab's pages: each page's width, which a test gives a unique value
+// per page, and where the bookmarks point. Used by tests/issue-6070.ts.
+TempStr PageInfoResultTemp(int* exitCodeOut) {
+    auto finish = [exitCodeOut](int code, TempStr s) -> TempStr {
+        if (exitCodeOut) {
+            *exitCodeOut = code;
+        }
+        return s;
+    };
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    WindowTab* tab = win ? win->CurrentTab() : nullptr;
+    DisplayModel* dm = tab ? tab->AsFixed() : nullptr;
+    if (!dm) {
+        return finish(2, str::DupTemp(StrL("NOTREADY no-document")));
+    }
+    str::Builder out;
+    EngineBase* engine = dm->GetEngine();
+    out.Append(fmt("pages=%d widths=", engine->PageCount()));
+    for (int i = 1; i <= engine->PageCount(); i++) {
+        out.Append(fmt(i == 1 ? "%d" : ",%d", (int)lroundf(engine->PageMediabox(i).dx)));
+    }
+    out.Append(StrL(" toc="));
+    TocTree* toc = engine->GetToc();
+    for (TocItem* it = toc && toc->root ? toc->root->child : nullptr; it; it = it->next) {
+        out.Append(fmt("%s:%d;", it->title, it->pageNo));
+    }
+    return finish(0, fmt("OK %s", ToStrTemp(out)));
+}
+
+// The sidebar's panels (HWND, visible, view, the view icons' enabled / selected
+// state and client rects) and its Thumbnails view: whether it shows, the current
+// page and, for clicking, each visible thumbnail in
+// its panel's client coords. Used by tests/sidebar-thumbnails.ts.
+TempStr SidebarThumbnailsResultTemp(int* exitCodeOut) {
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    PageThumbnailsCtrl* thumbs = win ? win->pageThumbs : nullptr;
+    if (!thumbs) {
+        if (exitCodeOut) {
+            *exitCodeOut = 2;
+        }
+        return str::DupTemp(StrL("NOTREADY no-window"));
+    }
+    SidebarPanel* shows = SidebarPanelShowing(win, SidebarView::Thumbnails);
+    HWND hwnd = shows ? shows->hwnd : win->sidebarTop->hwnd;
+    str::Builder sb;
+    sb.Append(fmt("hwnd=%d thumbnails=%d count=%d current=%d rendered=%d", (int)(intptr_t)hwnd,
+                  (int)thumbs->IsVisible(), thumbs->pageCount, thumbs->selectedPage, thumbs->RenderedCount()));
+    // the focus ring is drawn while the thumbnails have the (virtual) focus
+    sb.Append(fmt(" ring=%d", (int)thumbs->HasFlag(vwfFocused)));
+    // e.g. top=1234,1,thumbnails,110,010:2,2,22,22;26,2,22,22;50,2,22,22
+    // (enabled icons, selected icon, icon rects in order B, T, F)
+    SidebarPanel* panels[] = {win->sidebarTop, win->sidebarBottom};
+    bool visible[] = {win->uiState.sidebarTopVisible, win->uiState.sidebarBottomVisible};
+    Str names[] = {StrL("top"), StrL("bottom")};
+    for (int i = 0; i < 2; i++) {
+        SidebarPanel* p = panels[i];
+        sb.Append(fmt(" %s=%d,%d,%s,", names[i], (int)(intptr_t)p->hwnd, (int)visible[i], SidebarViewToStr(p->view)));
+        for (VirtIconButton* b : p->viewBtns) {
+            sb.Append(fmt("%d", (int)b->IsEnabled()));
+        }
+        sb.Append(StrL(","));
+        for (VirtIconButton* b : p->viewBtns) {
+            sb.Append(fmt("%d", (int)b->isSelected));
+        }
+        sb.Append(StrL(":"));
+        for (int j = 0; j < kSidebarViewCount; j++) {
+            Rect r = p->viewBtns[j]->BoundsInWindow();
+            sb.Append(fmt(j == 0 ? "%d,%d,%d,%d" : ";%d,%d,%d,%d", r.x, r.y, r.dx, r.dy));
+        }
+    }
+    sb.Append(StrL(" rects="));
+    for (int pageNo = 1; pageNo <= thumbs->pageCount; pageNo++) {
+        Rect r = thumbs->PageRect(pageNo);
+        sb.Append(fmt("%d:%d,%d,%d,%d;", pageNo, r.x, r.y, r.dx, r.dy));
+    }
+    if (exitCodeOut) {
+        *exitCodeOut = 0;
+    }
+    return ToStrTemp(sb);
+}
+
+// The first window's frame: whether it's maximized and the non-client strips
+// its WM_NCPAINT fills (window coords). Used by tests/issue-6259.ts.
+TempStr FrameNcStripsResultTemp(int* exitCodeOut) {
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    if (!win) {
+        if (exitCodeOut) {
+            *exitCodeOut = 2;
+        }
+        return str::DupTemp(StrL("NOTREADY no-window"));
+    }
+    Vec<Rect> strips;
+    GetFrameNcStrips(win, strips);
+    str::Builder sb;
+    sb.Append(fmt("zoomed=%d strips=%d", (int)IsZoomed(win->hwndFrame), len(strips)));
+    for (Rect& r : strips) {
+        sb.Append(fmt(" %d,%d,%d,%d", r.x, r.y, r.dx, r.dy));
+    }
+    if (exitCodeOut) {
+        *exitCodeOut = 0;
+    }
+    return ToStrTemp(sb);
+}
+
+// Sends the frame a mouse wheel while the window is marked as being closed, as
+// when a wheel arrives during CloseWindow(). Used by tests/wheel-while-closing.ts.
+TempStr WheelWhileClosingResultTemp(int* exitCodeOut) {
+    MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+    if (!win || !win->IsDocLoaded()) {
+        if (exitCodeOut) {
+            *exitCodeOut = 2;
+        }
+        return str::DupTemp(StrL("NOTREADY no-document"));
+    }
+    win->isBeingClosed = true;
+    SendMessageW(win->hwndFrame, WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+    win->isBeingClosed = false;
+    if (exitCodeOut) {
+        *exitCodeOut = 0;
+    }
+    return str::DupTemp(StrL("OK"));
 }

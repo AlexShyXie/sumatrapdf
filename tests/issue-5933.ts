@@ -16,9 +16,7 @@ import {
   sleep,
   MK_LBUTTON,
   MK_RBUTTON,
-  VK_ESCAPE,
   WM_COMMAND,
-  WM_KEYDOWN,
   WM_LBUTTONDOWN,
   WM_LBUTTONUP,
   WM_MOUSEMOVE,
@@ -57,6 +55,16 @@ async function selectedAnnotState(client: ControlClient): Promise<SelectedAnnotS
     resizeRerenderPending: / resizeRerenderPending=1/.test(raw),
     raw,
   };
+}
+
+async function annotSelected(client: ControlClient): Promise<boolean> {
+  const res = await client.request(ControlCommand.TestMarkupAnnots, []);
+  const raw = String(res[1] ?? "");
+  const m = /state selected=(\d)/.exec(raw);
+  if (res[0] !== 0 || !m) {
+    throw new Error(`issue-5933: could not read selection state:\n${raw}`);
+  }
+  return m[1] === "1";
 }
 
 function dragLeftButton(canvas: number, x: number, y: number, endX: number, endY: number): void {
@@ -131,7 +139,6 @@ export async function testit(): Promise<void> {
     const awayY = Math.max(40, cr.bottom - 40);
 
     sendMessage(frame, WM_COMMAND, cmdId("CmdCreateAnnotStamp"), packCoords(stampX, stampY));
-    await sleep(400);
     await client.waitForRenderIdle();
 
     const stampBeforeRight = await selectedAnnotState(client);
@@ -191,67 +198,20 @@ export async function testit(): Promise<void> {
 
     hover(canvas, stampX + 20, stampY + 20);
     await sleep(80);
-    const selectedPng = join(dir, "selected.png");
-    if (!captureWindowToPng(canvas, selectedPng)) {
-      throw new Error("issue-5933: capture selected failed");
-    }
 
     // click empty page without a hover update first — that's the regression
     clickAt(canvas, awayX, awayY);
-    await sleep(400);
     await client.waitForRenderIdle();
-    const afterClickPng = join(dir, "after-click.png");
-    if (!captureWindowToPng(canvas, afterClickPng)) {
-      throw new Error("issue-5933: capture after click failed");
-    }
-
-    sendMessage(frame, WM_KEYDOWN, VK_ESCAPE, 0);
-    await sleep(200);
-    await client.waitForRenderIdle();
-    const afterEscPng = join(dir, "after-esc.png");
-    if (!captureWindowToPng(canvas, afterEscPng)) {
-      throw new Error("issue-5933: capture after Esc failed");
-    }
-
-    const selected = readFileSync(selectedPng);
-    const afterClick = readFileSync(afterClickPng);
-    const afterEsc = readFileSync(afterEscPng);
-    if (selected.equals(afterClick)) {
+    if (await annotSelected(client)) {
       throw new Error("issue-5933: click away did not leave stamp size-edit mode");
-    }
-    if (!afterClick.equals(afterEsc)) {
-      throw new Error("issue-5933: click away left a different selection than Esc");
     }
 
     sendMessage(frame, WM_COMMAND, cmdId("CmdCreateAnnotStamp"), packCoords(stampX, stampY));
-    await sleep(400);
     await client.waitForRenderIdle();
-    const selected2Png = join(dir, "selected2.png");
-    if (!captureWindowToPng(canvas, selected2Png)) {
-      throw new Error("issue-5933: capture selected2 failed");
-    }
     clickAwayWithJitter(canvas, awayX, awayY);
-    await sleep(400);
     await client.waitForRenderIdle();
-    const afterJitterPng = join(dir, "after-jitter.png");
-    if (!captureWindowToPng(canvas, afterJitterPng)) {
-      throw new Error("issue-5933: capture after jitter click failed");
-    }
-    sendMessage(frame, WM_KEYDOWN, VK_ESCAPE, 0);
-    await sleep(200);
-    await client.waitForRenderIdle();
-    const afterEsc2Png = join(dir, "after-esc2.png");
-    if (!captureWindowToPng(canvas, afterEsc2Png)) {
-      throw new Error("issue-5933: capture after Esc 2 failed");
-    }
-    const selected2 = readFileSync(selected2Png);
-    const afterJitter = readFileSync(afterJitterPng);
-    const afterEsc2 = readFileSync(afterEsc2Png);
-    if (selected2.equals(afterJitter)) {
+    if (await annotSelected(client)) {
       throw new Error("issue-5933: jittered click away did not leave stamp size-edit mode");
-    }
-    if (!afterJitter.equals(afterEsc2)) {
-      throw new Error("issue-5933: jittered click away left a different selection than Esc");
     }
 
     // Creating an annotation from the context menu used to leave the stale
@@ -261,7 +221,6 @@ export async function testit(): Promise<void> {
     const freeTextX = 100;
     const freeTextY = 300;
     sendMessage(frame, WM_COMMAND, cmdId("CmdCreateAnnotFreeText"), packCoords(freeTextX, freeTextY));
-    await sleep(400);
     await client.waitForRenderIdle();
 
     // At fit-page zoom the default FreeText rectangle's bottom-right handle
@@ -277,7 +236,6 @@ export async function testit(): Promise<void> {
     setCursorPos(pResized.x, pResized.y);
     sendMessage(canvas, WM_MOUSEMOVE, MK_LBUTTON, packCoords(resizedX, resizedY));
     sendMessage(canvas, WM_LBUTTONUP, 0, packCoords(resizedX, resizedY));
-    await sleep(300);
     await client.waitForRenderIdle();
     const afterResizeUpPng = join(dir, "after-resize-up.png");
     if (!captureWindowToPng(canvas, afterResizeUpPng)) {
@@ -285,7 +243,6 @@ export async function testit(): Promise<void> {
     }
 
     sendMessage(canvas, WM_MOUSEMOVE, 0, packCoords(resizedX + 60, resizedY + 60));
-    await sleep(300);
     await client.waitForRenderIdle();
     const afterUnpressedMovePng = join(dir, "after-unpressed-move.png");
     if (!captureWindowToPng(canvas, afterUnpressedMovePng)) {

@@ -690,7 +690,7 @@ CommandVisibility GetCommandVisibility(int cmdId, const AppCommandCtx& ctx, Comm
         if (cmdId == CmdPdShowInfo || cmdId == CmdPdfBake || cmdId == CmdPdfCompress || cmdId == CmdPdfDecompress ||
             cmdId == CmdPdfEncrypt || cmdId == CmdPdfDecrypt || cmdId == CmdPdfDeletePages ||
             cmdId == CmdPdfExtractPages || cmdId == CmdTogglePageBoxes || cmdId == CmdConvertPdfToImages ||
-            cmdId == CmdToggleEditPDF) {
+            cmdId == CmdToggleEditPDF || cmdId == CmdMergePDF) {
             return CommandVisibility::Hide;
         }
     }
@@ -913,6 +913,9 @@ CommandVisibility GetCommandVisibility(int cmdId, const AppCommandCtx& ctx, Comm
     }
     if ((cmdId == CmdToggleBookmarks) || (cmdId == CmdToggleTableOfContents)) {
         return ctx.hasToc ? CommandVisibility::Show : CommandVisibility::Hide;
+    }
+    if (cmdId == CmdToggleThumbnails) {
+        return ctx.isFixedPage ? CommandVisibility::Show : CommandVisibility::Hide;
     }
 
     // No extractable text on comics, image folders, or single images.

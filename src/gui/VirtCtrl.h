@@ -314,6 +314,7 @@ struct VirtRoot {
     void SetChild(VirtCtrl*);
     // the tops found in a layout tree; not owned
     void SetTops(const Vec<VirtCtrl*>&);
+    void ForgetTops();
     void SetBounds(Rect);
     void LayoutIfNeeded();
     void RequestLayout();
@@ -753,6 +754,7 @@ struct LabelWithClose {
 VirtCloseButton* AsVirtCloseButton(ILayout*);
 LabelWithClose NewLabelWithClose(HWND hwndForDpi, PlatformFont*, const VirtMouseHandler& onClose);
 void ApplyLabelWithCloseDpi(VirtText*, VirtCloseButton*, int dpi);
+void ApplyCloseButtonDpi(VirtCloseButton*, int dpi);
 
 struct VirtImage : VirtCtrl {
     Pixmap* pixmap = nullptr; // not owned

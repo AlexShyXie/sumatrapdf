@@ -38,6 +38,8 @@ import { testit as issue1203 } from "./issue-1203.ts";
 import { testit as issue5792 } from "./issue-5792.ts";
 import { testit as issue5972 } from "./issue-5972.ts";
 import { testit as annotFilterToolbar } from "./annot-filter-toolbar.ts";
+import { testit as dviOpen } from "./dvi-open.ts";
+import { testit as fontCacheShutdown } from "./font-cache-shutdown.ts";
 
 // The slowest of the regular tests. They still run here and in the daily CI
 // suite, just not in run-pre-release: a couple of seconds each is nothing on
@@ -71,6 +73,9 @@ export const slowTests: NamedTest[] = [
   ["issue-5865", issue5865],
   ["security-ghsa-crhm-w5qr-wjj4", ghsaCrhmW5qrWjj4],
   ["issue-1195", issue1195],
+  ["dvi-open", dviOpen],
+  // quits during background EPUB layout; ASan catches the font-cache use-after-free
+  ["font-cache-shutdown", fontCacheShutdown],
 ];
 
 export const tests: NamedTest[] = [...almostAllTests, ...notInPreReleaseTests, ...slowTests];

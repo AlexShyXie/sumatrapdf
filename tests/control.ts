@@ -106,6 +106,11 @@ export enum ControlCommand {
   TestToggleFormButton = 109,
   ResolveUnsavedChanges = 110,
   TestRefHover = 111,
+  TestPageInfo = 112,
+  TestSidebarThumbnails = 113,
+  TestFrameNcStrips = 114,
+  TestMergePdf = 115,
+  TestWheelWhileClosing = 116,
 }
 
 export type ControlArg = number | string | Uint8Array | ControlArg[];
@@ -124,6 +129,9 @@ export type HomeSelection = {
   listIcon: number[];
   thumbsArea: number[];
   lastCaption: number[];
+  // "<isPromo>,<index>" of the tip shown, and its band
+  tip: string;
+  tipRect: number[];
   raw: string;
 };
 
@@ -515,11 +523,13 @@ export class ControlClient {
         listIcon: [0, 0, 0, 0],
         thumbsArea: [0, 0, 0, 0],
         lastCaption: [0, 0, 0, 0],
+        tip: "",
+        tipRect: [0, 0, 0, 0],
         raw,
       };
     }
     const m =
-      /OK sel=(-?\d+) entries=(\d+) searchFocus=(\d) searchBox=(\d) search=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outline=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outlineFull=(-?\d+),(-?\d+),(-?\d+),(-?\d+) path=(.*) listView=(\d) listIcon=(-?\d+),(-?\d+),(-?\d+),(-?\d+) thumbsArea=(-?\d+),(-?\d+),(-?\d+),(-?\d+) lastCaption=(-?\d+),(-?\d+),(-?\d+),(-?\d+)$/.exec(
+      /OK sel=(-?\d+) entries=(\d+) searchFocus=(\d) searchBox=(\d) search=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outline=(-?\d+),(-?\d+),(-?\d+),(-?\d+) outlineFull=(-?\d+),(-?\d+),(-?\d+),(-?\d+) path=(.*) listView=(\d) listIcon=(-?\d+),(-?\d+),(-?\d+),(-?\d+) thumbsArea=(-?\d+),(-?\d+),(-?\d+),(-?\d+) lastCaption=(-?\d+),(-?\d+),(-?\d+),(-?\d+) tip=(\d,-?\d+) tipRect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)$/.exec(
         raw,
       );
     if (!m) {
@@ -539,6 +549,8 @@ export class ControlClient {
       listIcon: [parseInt(m[19], 10), parseInt(m[20], 10), parseInt(m[21], 10), parseInt(m[22], 10)],
       thumbsArea: [parseInt(m[23], 10), parseInt(m[24], 10), parseInt(m[25], 10), parseInt(m[26], 10)],
       lastCaption: [parseInt(m[27], 10), parseInt(m[28], 10), parseInt(m[29], 10), parseInt(m[30], 10)],
+      tip: m[31],
+      tipRect: [parseInt(m[32], 10), parseInt(m[33], 10), parseInt(m[34], 10), parseInt(m[35], 10)],
       raw,
     };
   }
@@ -773,7 +785,7 @@ export async function withControlledSumatra<T>(
   let fnErr: unknown;
   let fnOk = false;
   try {
-    client = await ControlClient.connect(pipeName, options.connectTimeoutMs ?? 10000);
+    client = await ControlClient.connect(pipeName, options.connectTimeoutMs ?? 10_000 * SLOW_BUILD_FACTOR);
     result = await fn(client, proc);
     fnOk = true;
   } catch (e) {

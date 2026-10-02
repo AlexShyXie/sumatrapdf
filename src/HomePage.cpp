@@ -100,16 +100,31 @@ constexpr int kAboutLineOuterSize = 1;
 #endif
 constexpr int kAboutLineSepSize = 1;
 
+// one tip per line; cmd/trans-dl.ts extracts each line for translation
 static Str sumatraTips = StrL(R"tips(You can [customize scrollbar](CmdChangeScrollbar).
 You can [customize keyboard shortcuts](Help/Customize-keyboard-shortcuts).
 You can [customize toolbar](Help/Customize-toolbar).
-Press (Key/CmdCommandPalette) to open [command palette](CmdCommandPalette).
-To open file from history open [command palette](CmdCommandPalette) with (Key/CmdCommandPalette) and type `#`.
+Press (Kbd/(Key/CmdCommandPalette)) to open [command palette](CmdCommandPalette).
+To open file from history open [command palette](CmdCommandPalette) with (Kbd/(Key/CmdCommandPalette)) and type (Kbd/#).
 You can [extract text from PDF file](Help/Tool-x-extract-text-from-pdf).
-You can [toggle menu bar](CmdToggleMenuBar) with (Key/CmdToggleMenuBar).
-You can [toggle toolbar](CmdToggleToolbar) with (Key/CmdToggleToolbar).
+You can [toggle menu bar](CmdToggleMenuBar) with (Kbd/(Key/CmdToggleMenuBar)).
+You can [toggle toolbar](CmdToggleToolbar) with (Kbd/(Key/CmdToggleToolbar)).
 You can [edit PDF annotations](Help/Editing-annotations).
-You can preview where a citation, figure or footnote link points by hovering it — [Toggle Citation Hover Preview](CmdToggleHoverPreview) or set CitationHoverDelay in [advanced settings](CmdAdvancedSettings).
+You can enable [citation preview on hover](Help/Citation-hover-preview).
+You can [have documents read aloud](Help/Read-Aloud).
+You can [sign a PDF](Help/Sign-a-PDF).
+You can [fill PDF forms](Help/Fill-PDF-forms).
+You can [merge PDFs](Help/Merge-PDFs) and [reorder pages](Help/Reorder-PDF-pages).
+You can [split a PDF](Help/Split-a-PDF).
+You can [redact a PDF](Help/Redact-a-PDF).
+You can [present a PDF](Help/Present-a-PDF) full screen.
+You can [use SumatraPDF with LaTeX](Help/LaTeX-integration) for forward and inverse search.
+You can [read comics and manga](Help/Comics-and-manga) right to left.
+You can [bookmark pages as favorites](Help/Managing-favorites).
+You can [chat with AI about a document](Help/AI-Chat-with-document).
+You can [customize theme colors](Help/Customize-theme-colors).
+You can [save a page region as an image](Help/Save-page-region-as-image).
+You can [print selected pages](Help/Print-selected-pages).
 )tips");
 
 static Str sumatraPromos = StrL(R"promos(Try [Edna](https://edna.arslexis.io): a note taking web app for power users.
@@ -127,7 +142,7 @@ static bool gTipsParsed = false;
 static bool gSelectedIsPromo = false;
 static int gSelectedTipIdx = -1;
 
-static void CollectTipsFromString(Str src, Str prefix, StrVec* out) {
+static void CollectTipsFromString(Str src, StrVec* out) {
     StrVec lines;
     Split(&lines, src, StrL("\n"));
     for (int i = 0; i < len(lines); i++) {
@@ -135,11 +150,7 @@ static void CollectTipsFromString(Str src, Str prefix, StrVec* out) {
         if (str::IsEmptyOrWhiteSpace(line)) {
             continue;
         }
-        if (prefix) {
-            out->Append(str::JoinTemp(prefix, line));
-        } else {
-            out->Append(line);
-        }
+        out->Append(line);
     }
 }
 
@@ -152,7 +163,11 @@ static Str SelectedTipLine() {
     if (gSelectedTipIdx >= len(v)) {
         return {};
     }
-    return v[gSelectedTipIdx];
+    if (gSelectedIsPromo) {
+        return v[gSelectedTipIdx];
+    }
+    // translated when shown, so a language change applies without re-parsing
+    return str::JoinTemp(Tr("Tip:"), StrL(" "), Tr(v[gSelectedTipIdx]));
 }
 
 static void PickRandomTipOrPromo() {
@@ -170,8 +185,8 @@ static void EnsureTipsParsed() {
     if (gTipsParsed) {
         return;
     }
-    CollectTipsFromString(sumatraTips, StrL("Tip: "), &gTipLines);
-    CollectTipsFromString(sumatraPromos, {}, &gPromoLines);
+    CollectTipsFromString(sumatraTips, &gTipLines);
+    CollectTipsFromString(sumatraPromos, &gPromoLines);
     gTipsParsed = true;
     PickRandomTipOrPromo();
 }
@@ -1130,12 +1145,12 @@ struct HomeEntriesCtrl : VirtCtrl {
 };
 
 // the tip band at the bottom. The markup is its VirtRichText child, which draws
-// itself and runs its own links; clicking the band anywhere else picks another
+// itself and runs its own links; double-clicking the band anywhere else picks another
 // tip
 struct HomeTipCtrl : VirtCtrl {
     // for link commands inside the tip markup (like VirtRichText)
     HWND hwndForCmds = nullptr;
-    // onClick (VirtCtrl): band click outside a link picks another tip
+    // onDoubleClick (VirtCtrl): double-click outside a link picks another tip
     VirtRichText* rich = nullptr; // owned, as our only child
     Str richFor;                  // owned, the markup `rich` was parsed from
 
@@ -2324,11 +2339,14 @@ TempStr HomeSelectionResultTemp(int* exitCodeOut) {
     if (!HomePageIsListView() && len(c.thumbs) > 0) {
         lastCaption = c.thumbs[len(c.thumbs) - 1].rcText;
     }
+    // the tip shown (promo or tip, index) and its band, for picking another one
+    Rect tipRect = c.hasTip ? c.rcTip : Rect{};
     return finish(0, fmt("OK sel=%d entries=%d searchFocus=%d searchBox=%d search=%s outline=%s outlineFull=%s path=%s "
-                         "listView=%d listIcon=%s thumbsArea=%s lastCaption=%s",
+                         "listView=%d listIcon=%s thumbsArea=%s lastCaption=%s tip=%d,%d tipRect=%s",
                          sel, len(c.thumbs), searchFocus, searchBox, RectCsvTemp(search), RectCsvTemp(outline),
                          RectCsvTemp(outlineFull), path, HomePageIsListView() ? 1 : 0, RectCsvTemp(c.rcIconListView),
-                         RectCsvTemp(c.rcThumbsArea), RectCsvTemp(lastCaption)));
+                         RectCsvTemp(c.rcThumbsArea), RectCsvTemp(lastCaption), gSelectedIsPromo ? 1 : 0,
+                         gSelectedTipIdx, RectCsvTemp(tipRect)));
 }
 
 // What the home page list drew for each row: the path, the size text as drawn,
@@ -2582,9 +2600,12 @@ static void HomePaletteClicked(MainWindow* win, VirtMouseEvent*) {
     HwndSendCommand(win->hwndFrame, CmdCommandPalette);
 }
 
-static void HomeTipBandClicked(MainWindow* win, VirtMouseEvent*) {
+static void HomeTipBandDoubleClicked(MainWindow* win, VirtMouseEvent* ev) {
+    ev->didHandle = true;
     PickAnotherRandomPromotion();
-    win->RedrawAll(true);
+    // painting reuses the layout, which holds the parsed tip
+    HomePageRelayout(win);
+    HwndInvalidate(win->hwndCanvas);
 }
 
 HomeListIconCtrl::HomeListIconCtrl() {
@@ -2910,7 +2931,7 @@ static HomeChromeCtrl* EnsureHomeChrome(MainWindow* win) {
     // entries. Below everything else: the tip band sits at the bottom of the page
     chrome->tip = new HomeTipCtrl();
     chrome->tip->hwndForCmds = win->hwndFrame;
-    chrome->tip->onClick = MkFunc1(HomeTipBandClicked, win);
+    chrome->tip->onDoubleClick = MkFunc1(HomeTipBandDoubleClicked, win);
     chrome->AddChild(chrome->tip);
 
     chrome->searchBorder = new HomeSearchBorderCtrl();

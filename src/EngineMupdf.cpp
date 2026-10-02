@@ -3579,6 +3579,12 @@ static void DeInitializeEngineMupdf() {
     gPerThreadContexts = nullptr;
 }
 
+// Shutdown waits for this to hit zero before freeing the system-font cache.
+// FreeType faces alias those bytes until ~EngineMupdf drops the document.
+int EngineMupdfCount() {
+    return AtomicIntGet(&gEngineCount);
+}
+
 static fz_context* GetOrClonePerThreadContext(EngineMupdf* engine, fz_context* ctx) {
     ThreadId threadID = GetCurrentThreadId();
     {
@@ -3675,6 +3681,47 @@ fz_context* EngineMupdf::Ctx() const {
     return GetOrClonePerThreadContext(const_cast<EngineMupdf*>(this), _ctx);
 }
 
+// Frees what a page holds and leaves it empty but valid
+static void FreePageInfo(fz_context* ctx, FzPageInfo* pi) {
+    DeleteVecMembers(pi->links);
+    DeleteVecMembers(pi->autoLinks);
+    DeleteVecMembers(pi->comments);
+    for (FitzPageImageInfo* img : pi->images) {
+        if (img && img->image) {
+            fz_drop_image(ctx, img->image);
+            img->image = nullptr;
+        }
+    }
+    DeleteVecMembers(pi->images);
+    DeleteVecMembers(pi->annotations);
+    DeleteVecMembers(pi->widgets);
+    if (pi->retainedLinks) {
+        fz_drop_link(ctx, pi->retainedLinks);
+        pi->retainedLinks = nullptr;
+    }
+    if (pi->displayList) {
+        fz_drop_display_list(ctx, pi->displayList);
+        pi->displayList = nullptr;
+    }
+    PdfDarkModeInvalidatePage(ctx, pi);
+    if (pi->page) {
+        fz_drop_page(ctx, pi->page);
+        pi->page = nullptr;
+    }
+    // free the buffers, not just the elements: a dropped page is never destroyed
+    VecReset(pi->links);
+    VecReset(pi->autoLinks);
+    VecReset(pi->comments);
+    VecReset(pi->images);
+    VecReset(pi->annotations);
+    VecReset(pi->widgets);
+    VecReset(pi->allElements);
+    VecReset(pi->darkLegacySkipDevAbs);
+    pi->annotsLoaded = false;
+    pi->fullyLoaded = false;
+    pi->elementsNeedRebuilding = true;
+}
+
 EngineMupdf::~EngineMupdf() {
     pagesLock.Lock();
 
@@ -3688,31 +3735,8 @@ EngineMupdf::~EngineMupdf() {
             continue;
         }
         for (FzPageInfo* pi : *v) {
-            DeleteVecMembers(pi->links);
-            DeleteVecMembers(pi->autoLinks);
-            DeleteVecMembers(pi->comments);
-            for (FitzPageImageInfo* img : pi->images) {
-                if (img && img->image) {
-                    fz_drop_image(ctx, img->image);
-                    img->image = nullptr;
-                }
-            }
-            DeleteVecMembers(pi->images);
-            DeleteVecMembers(pi->annotations);
-            DeleteVecMembers(pi->widgets);
-            if (pi->retainedLinks) {
-                fz_drop_link(ctx, pi->retainedLinks);
-            }
-            if (pi->displayList) {
-                fz_drop_display_list(ctx, pi->displayList);
-            }
-            PdfDarkModeInvalidatePage(ctx, pi);
-            if (pi->page) {
-                fz_drop_page(ctx, pi->page);
-            }
-            // storage is arena-owned; run the destructor in place so the inner
-            // Vec<>s free their heap-allocated els buffers, then leave the
-            // memory to the arena.
+            FreePageInfo(ctx, pi);
+            // storage is arena-owned: destroy in place, the arena frees it
             pi->~FzPageInfo();
         }
         v->~Vec<FzPageInfo*>();
@@ -4796,6 +4820,72 @@ static bool IsLinearizedFile(EngineMupdf* e) {
 }
 
 // one vector, pageCount full entries: PDF, XPS and single-chapter reflow docs
+// size of each page of a PDF, from its page object. Caller holds docLock
+static void LoadPdfPageMediaboxes(EngineMupdf* e) {
+    auto* ctx = e->Ctx();
+    for (int pageNo = 0; pageNo < e->pageCount; pageNo++) {
+        pdf_obj* pageref = nullptr;
+        fz_rect mbox{};
+        fz_matrix page_ctm{};
+        fz_var(pageref);
+        fz_var(mbox);
+        fz_try(ctx) {
+            // note: don't pdf_drop_obj() this
+            pageref = pdf_lookup_page_obj(ctx, e->pdfdoc, pageNo);
+            pdf_page_obj_transform(ctx, pageref, &mbox, &page_ctm);
+            mbox = fz_transform_rect(mbox, page_ctm);
+        }
+        fz_catch(ctx) {
+            fz_report_error(ctx);
+            mbox = {};
+        }
+        if (fz_is_empty_rect(mbox)) {
+            logf("cannot find page size for page %d", pageNo);
+            mbox.x0 = 0;
+            mbox.y0 = 0;
+            mbox.x1 = 612;
+            mbox.y1 = 792;
+        }
+        FzPageInfo* pageInfo = (*e->chapterPages[0])[pageNo];
+        pageInfo->mediabox = ToRectF(mbox);
+    }
+}
+
+// Caller holds docLock
+static void LoadPdfPageLabels(EngineMupdf* e) {
+    auto* ctx = e->Ctx();
+    if (e->pageLabels) {
+        e->pageLabels->~StrVec();
+        e->pageLabels = nullptr;
+    }
+    e->hasPageLabels = false;
+    pdf_obj* labels = nullptr;
+    fz_var(labels);
+    fz_try(ctx) {
+        labels = pdf_dict_getp(ctx, pdf_trailer(ctx, e->pdfdoc), "Root/PageLabels");
+        if (labels) {
+            e->pageLabels = BuildPageLabelVec(e->arena, ctx, labels, e->PageCount());
+        }
+    }
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+        fz_warn(ctx, "Couldn't load page labels");
+    }
+    if (!e->pageLabels) {
+        return;
+    }
+    e->hasPageLabels = true;
+    int maxN = 0;
+    int n = len(*e->pageLabels);
+    for (int i = 0; i < n; i++) {
+        int v = 0;
+        if (str::Parse((*e->pageLabels)[i], "%d%$", &v).s && v > maxN) {
+            maxN = v;
+        }
+    }
+    e->logicalPageCount = maxN;
+}
+
 static void InitChapterPagesFlat(EngineMupdf* e) {
     VecResize(e->chapterPages, 1);
     auto* v = New<Vec<FzPageInfo*>>(e->arena);
@@ -4835,8 +4925,8 @@ static void FinishNonPDFLoading(EngineMupdf* e) {
     auto* ctx = e->Ctx();
     if (e->isReflowable && e->HasChapters()) {
         // don't fz_load_chapter_page here: that lays out chapter 1, and the
-        // chapter the user is reopening may be a different one. every reflow
-        // page shares the size passed to fz_layout_document
+        // chapter the user is reopening may be a different one. placeholder
+        // until LayOutChapter(); a viewport can make the real page larger
         float dx = e->ebookLayoutW > 1 ? e->ebookLayoutW : 612;
         float dy = e->ebookLayoutH > 1 ? e->ebookLayoutH : 792;
         RectF mediabox(0, 0, dx, dy);
@@ -5041,32 +5131,7 @@ bool EngineMupdf::FinishLoading() {
 
     AutoUnlockRecursiveMutex scope(&docLock);
 
-    for (int pageNo = 0; pageNo < pageCount; pageNo++) {
-        pdf_obj* pageref = nullptr;
-        fz_rect mbox{};
-        fz_matrix page_ctm{};
-        fz_var(pageref);
-        fz_var(mbox);
-        fz_try(ctx) {
-            // note: don't pdf_drop_obj() this
-            pageref = pdf_lookup_page_obj(ctx, pdfdoc, pageNo);
-            pdf_page_obj_transform(ctx, pageref, &mbox, &page_ctm);
-            mbox = fz_transform_rect(mbox, page_ctm);
-        }
-        fz_catch(ctx) {
-            fz_report_error(ctx);
-            mbox = {};
-        }
-        if (fz_is_empty_rect(mbox)) {
-            logf("cannot find page size for page %d", pageNo);
-            mbox.x0 = 0;
-            mbox.y0 = 0;
-            mbox.x1 = 612;
-            mbox.y1 = 792;
-        }
-        FzPageInfo* pageInfo = (*chapterPages[0])[pageNo];
-        pageInfo->mediabox = ToRectF(mbox);
-    }
+    LoadPdfPageMediaboxes(this);
 
     fz_try(ctx) {
         outline = fz_load_outline(ctx, _doc);
@@ -5134,30 +5199,7 @@ bool EngineMupdf::FinishLoading() {
         pdfInfo = nullptr;
     }
 
-    pdf_obj* labels = nullptr;
-    fz_var(labels);
-    fz_try(ctx) {
-        labels = pdf_dict_getp(ctx, pdf_trailer(ctx, pdfdoc), "Root/PageLabels");
-        if (labels) {
-            pageLabels = BuildPageLabelVec(arena, ctx, labels, PageCount());
-        }
-    }
-    fz_catch(ctx) {
-        fz_report_error(ctx);
-        fz_warn(ctx, "Couldn't load page labels");
-    }
-    if (pageLabels) {
-        hasPageLabels = true;
-        int maxN = 0;
-        int n = len(*pageLabels);
-        for (int i = 0; i < n; i++) {
-            int v = 0;
-            if (str::Parse((*pageLabels)[i], "%d%$", &v).s && v > maxN) {
-                maxN = v;
-            }
-        }
-        logicalPageCount = maxN;
-    }
+    LoadPdfPageLabels(this);
 
     // enable mupdf's JavaScript engine so form-field calculate / validate /
     // format actions run (e.g. auto-summed totals on a fillable form). mujs is
@@ -5201,6 +5243,81 @@ void EngineMupdf::WarmChapter(int chapter) {
     }
 }
 
+static bool RectNear(RectF a, RectF b) {
+    auto delta = [](float x, float y) {
+        float d = x - y;
+        return d < 0 ? -d : d;
+    };
+    return delta(a.x, b.x) < 1.f && delta(a.y, b.y) < 1.f && delta(a.dx, b.dx) < 1.f && delta(a.dy, b.dy) < 1.f;
+}
+
+// caller holds pagesLock. Fixed-layout viewports are larger than the A5
+// placeholder; matching chapters share one box, a different size is per page.
+// True when a display model that cached the old size must rebuild.
+static bool ApplyChapterMediabox(EngineMupdf* e, int chapter, RectF measured) {
+    if (measured.IsEmpty() || chapter < 1 || chapter > len(e->chapterPages)) {
+        return false;
+    }
+    Vec<FzPageInfo*>* v = e->chapterPages[chapter - 1];
+    if (!v) {
+        return false;
+    }
+    RectF previous = len(*v) > 0 ? (*v)[0]->mediabox : RectF{};
+    for (FzPageInfo* pi : *v) {
+        pi->mediabox = measured;
+    }
+
+    int nCh = len(e->chapterPages);
+    int had = len(e->chapterBoxMeasured);
+    if (had < nCh) {
+        VecResize(e->chapterBoxMeasured, nCh);
+        for (int i = had; i < nCh; i++) {
+            e->chapterBoxMeasured[i] = 0;
+        }
+    }
+    e->chapterBoxMeasured[chapter - 1] = 1;
+
+    if (e->reflowPagesVary) {
+        return !RectNear(previous, measured);
+    }
+    if (RectNear(measured, e->reflowMediabox)) {
+        return false;
+    }
+
+    for (int i = 0; i < nCh; i++) {
+        if (i == chapter - 1 || !e->chapterBoxMeasured[i]) {
+            continue;
+        }
+        Vec<FzPageInfo*>* other = e->chapterPages[i];
+        if (!other || len(*other) < 1) {
+            continue;
+        }
+        if (!RectNear((*other)[0]->mediabox, measured)) {
+            e->reflowPagesVary = true;
+            return true;
+        }
+    }
+
+    // this is the book's page size until some chapter measures otherwise
+    RectF old = e->reflowMediabox;
+    e->reflowMediabox = measured;
+    for (int i = 0; i < nCh; i++) {
+        if (e->chapterBoxMeasured[i]) {
+            continue;
+        }
+        Vec<FzPageInfo*>* other = e->chapterPages[i];
+        if (!other) {
+            continue;
+        }
+        for (FzPageInfo* pi : *other) {
+            if (pi->mediabox.IsEmpty() || RectNear(pi->mediabox, old)) {
+                pi->mediabox = measured;
+            }
+        }
+    }
+    return !RectNear(old, measured);
+}
+
 // Lays out one EPUB chapter on demand; single-chapter docs are laid out at
 // FinishLoading. IsLaidOut() makes repeat/racing calls and a post-reset
 // re-layout idempotent, trusting the freshly counted page total each time.
@@ -5214,21 +5331,36 @@ int EngineMupdf::LayOutChapter(int chapter) {
 
     auto* ctx = Ctx();
     int n = 1;
+    fz_rect bound = fz_empty_rect;
     {
         AutoUnlockRecursiveMutex docScope(&docLock);
+        fz_page* page = nullptr;
         fz_var(n);
+        fz_var(page);
+        fz_var(bound);
         fz_try(ctx) {
             n = fz_count_chapter_pages(ctx, _doc, chapter - 1);
+            if (n >= 1) {
+                // every page of one HTML chapter shares html->page_w/h
+                page = fz_load_chapter_page(ctx, _doc, chapter - 1, 0);
+                bound = fz_bound_page(ctx, page);
+            }
+        }
+        fz_always(ctx) {
+            fz_drop_page(ctx, page);
         }
         fz_catch(ctx) {
             fz_report_error(ctx);
             n = 1;
+            bound = fz_empty_rect;
         }
     }
     if (n < 1) {
         n = 1;
     }
+    RectF measured = fz_is_empty_rect(bound) ? RectF{} : ToRectF(bound);
 
+    bool staleBox = false;
     {
         AutoUnlockRecursiveMutex pagesScope(&pagesLock);
         if (chapters.Generation() != gen) {
@@ -5251,7 +5383,11 @@ int EngineMupdf::LayOutChapter(int chapter) {
                 pi->~FzPageInfo();
                 VecRemoveLast(*v);
             }
+            staleBox = ApplyChapterMediabox(this, chapter, measured);
         }
+    }
+    if (staleBox) {
+        chapters.BumpGeneration();
     }
 
     chapters.SetPageCount(chapter, n);
@@ -6393,9 +6529,18 @@ FzPageInfo* EngineMupdf::GetFzPageInfo(Location loc, bool loadQuick, fz_cookie* 
 RectF EngineMupdf::PageMediabox(int pageNo) {
     // a reflow doc has one mediabox for every page, so answer even for a page
     // number a caller hasn't resynced yet: a restyle (ApplyReflowThemeCss)
-    // resets the chapter table, shrinking pageCount under DisplayModel
-    if (isReflowable) {
+    // resets the chapter table, shrinking pageCount under DisplayModel.
+    // reflowPagesVary: fixed-layout chapters measured to different sizes.
+    if (isReflowable && !reflowPagesVary) {
         return reflowMediabox;
+    }
+    if (isReflowable) {
+        if (pageNo < 1 || pageNo > pageCount) {
+            return reflowMediabox;
+        }
+        AutoUnlockRecursiveMutex scope(&pagesLock);
+        FzPageInfo* pi = PageInfoByPageNo(pageNo);
+        return pi && !pi->mediabox.IsEmpty() ? pi->mediabox : reflowMediabox;
     }
     ReportIf(pageNo < 1 || pageNo > pageCount);
     if (pageNo < 1 || pageNo > pageCount) {
@@ -9921,6 +10066,101 @@ static void SyncPagesAfterUndoRedo(EngineMupdf* e, Vec<Annotation*>& removedOut)
         InvalidateFzPageAfterContentChange(e, pi);
         e->InvalidateTextForPage(pi->pageNo);
     });
+}
+
+//--- merging PDFs
+
+static pdf_document* OpenPdfForMerge(fz_context* ctx, const PdfMergeSource& src) {
+    pdf_document* doc = pdf_open_document(ctx, CStrTemp(src.path));
+    if (!pdf_needs_password(ctx, doc)) {
+        return doc;
+    }
+    const char* pwd = len(src.password) > 0 ? CStrTemp(src.password) : "";
+    if (!pdf_authenticate_password(ctx, doc, pwd)) {
+        pdf_drop_document(ctx, doc);
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "the PDF is password protected");
+    }
+    return doc;
+}
+
+// Write the pages, in order, to destPath, which must not be one of the sources.
+// srcs[0] is the base: its pages keep annotations, links and bookmarks. Pages of
+// the others are grafted, with annotations and form fields flattened (grafting
+// copies only the content).
+bool EngineMupdfMergePdfs(const Vec<PdfMergeSource>& srcs, const Vec<PdfMergePage>& pages, Str destPath) {
+    int nPages = len(pages);
+    if (len(srcs) == 0 || nPages == 0) {
+        return false;
+    }
+    fz_context* ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
+    if (!ctx) {
+        return false;
+    }
+    // index in the base document of each page of the result
+    Vec<int> order;
+    VecAppendBlanks(order, nPages);
+    pdf_document* doc = nullptr;
+    pdf_document* src = nullptr;
+    pdf_graft_map* map = nullptr;
+    bool ok = false;
+    fz_var(doc);
+    fz_var(src);
+    fz_var(map);
+    fz_var(ok);
+    fz_try(ctx) {
+        doc = OpenPdfForMerge(ctx, srcs[0]);
+        int nBase = pdf_count_pages(ctx, doc);
+        for (int i = 0; i < nPages; i++) {
+            if (pages[i].src == 0) {
+                if (pages[i].pageNo < 1 || pages[i].pageNo > nBase) {
+                    fz_throw(ctx, FZ_ERROR_ARGUMENT, "no page %d", pages[i].pageNo);
+                }
+                order[i] = pages[i].pageNo - 1;
+            }
+        }
+        // the pages of the other sources go to the end, then into place below
+        for (int s = 1; s < len(srcs); s++) {
+            src = OpenPdfForMerge(ctx, srcs[s]);
+            // in memory only: the file isn't changed
+            pdf_bake_document(ctx, src, 1, 1);
+            int nSrc = pdf_count_pages(ctx, src);
+            map = pdf_new_graft_map(ctx, doc);
+            for (int i = 0; i < nPages; i++) {
+                if (pages[i].src != s) {
+                    continue;
+                }
+                if (pages[i].pageNo < 1 || pages[i].pageNo > nSrc) {
+                    fz_throw(ctx, FZ_ERROR_ARGUMENT, "no page %d", pages[i].pageNo);
+                }
+                order[i] = pdf_count_pages(ctx, doc);
+                pdf_graft_mapped_page(ctx, map, -1, src, pages[i].pageNo - 1);
+            }
+            pdf_drop_graft_map(ctx, map);
+            map = nullptr;
+            pdf_drop_document(ctx, src);
+            src = nullptr;
+        }
+        // drops the pages not in order and fixes bookmarks and links to them
+        pdf_rearrange_pages(ctx, doc, nPages, order.els, PDF_CLEAN_STRUCTURE_KEEP);
+
+        pdf_write_options opts = pdf_default_write_options2;
+        opts.do_compress = 1;
+        // the dropped pages' objects
+        opts.do_garbage = 3;
+        pdf_save_document(ctx, doc, CStrTemp(destPath), &opts);
+        ok = true;
+    }
+    fz_always(ctx) {
+        pdf_drop_graft_map(ctx, map);
+        pdf_drop_document(ctx, src);
+        pdf_drop_document(ctx, doc);
+    }
+    fz_catch(ctx) {
+        fz_report_error(ctx);
+        logf("EngineMupdfMergePdfs: saving '%s' failed: '%s'\n", destPath, Str(fz_caught_message(ctx)));
+    }
+    fz_drop_context(ctx);
+    return ok;
 }
 
 // Step one operation back (or forward with redo). Returns false if there was
