@@ -1,4 +1,5 @@
-[![Build](https://github.com/sumatrapdfreader/sumatrapdf/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/sumatrapdfreader/sumatrapdf/actions/workflows/build.yml)
+[![Build](https://github.com/AlexShyXie/sumatrapdf-sidecar/actions/workflows/build.yml/badge.svg?branch=add_sidecar)](https://github.com/sumatrapdfreader/sumatrapdf/actions/workflows/build.yml)
+
 ## SumatraPDF Reader with sidecar
 
 SumatraPDF is a multi-format (PDF, EPUB, MOBI, CBZ, CBR, FB2, CHM, XPS, DjVu) reader
@@ -42,12 +43,14 @@ Settings (AdvancedSettings):
 | --------------------------- | ------- | ----------------------------------------- |
 | `Annotations.separateSave`  | false   | Enable the sidecar feature                |
 | `Annotations.centralFolder` | (empty) | Central directory for storing annotations |
+| `Annotations.separateSaveAsMd` | false | Save sidecar as Markdown instead of JSON (**experimental**, see below) |
 
 ```ini
 Annotations [
     ....
 	SeparateSave = true
 	CentralFolder = E:\Downloads\Claw
+	SeparateSaveAsMd = true
 ]
 ```
 
@@ -68,6 +71,33 @@ Stamp and FileAttachment carry binary payloads (images, embedded files), which t
 - **No conflict merging.** If two machines modify the same sidecar simultaneously, the last save overwrites the earlier one. Fine for single-user use.
 - Large annotations have defensive limits: 512 vertices for polygons/polylines, 64 strokes for ink, with at most 2048 points per stroke. Anything beyond these limits is truncated.
 - Other readers won't see the annotations when opening this PDF — the data lives in the JSON, not in the PDF. This is by design.
+
+## Markdown sidecar (experimental 🧪)
+With `SeparateSaveAsMd = true`, annotations are saved as `book.md` instead of `book.json`: each annotation is an Obsidian callout, editable with any Markdown editor.
+```markdown
+---
+sumatrapdf_sidecar: 2
+generator: SumatraPDF-sidecar/2-md
+file: book.pdf
+---
+# mybooknote
+> [!Note]
+> type: highlight
+> page: 11
+> rect: [58.4,695.2,299.6,708.4]
+> quads: [[58.4,708.4,299.6,695.2,58.4,695.2,299.6,708.4]]
+> text: highlighted words
+> contents: highlighted words
+> author: AlexShy
+```
+Rules:
+- **Everything outside callouts is yours.** Headings, prose, ordinary quote blocks — SumatraPDF preserves them verbatim on read/write, touching only the machine lines in `key: value` form inside callouts. Annotation data and annotation notes now live in the same file.
+- **The `contents` line is always present.** When there's no annotation note, it is filled with the highlighted text; when both are empty it's `contents: ""` — fill it in by hand in Obsidian, and it takes effect when the document is reopened.
+- **Two-way sync, bounded by reopening.** Delete a callout after closing the document, and that annotation is gone on reopen; hand-write a valid callout (not recommended — coordinates are hard to compute precisely) and it becomes a real annotation on reopen. If you edit the md while the document is open, your changes will be overwritten by session data on save — close the document before editing externally.
+- **Automatic migration.** When enabled, `.md` is read first, falling back to `.json` if absent; the next save writes `.md`, and the old `.json` is left untouched and no longer updated.
+- **Atomic writes.** The md is mixed with your notes, so saving goes through a temp file + replace — a mid-save crash won't corrupt the file.
+- **Querying**: front matter is YAML; `key:: value` double-colon syntax inside callouts is compatible with Dataview.
+⚠️ **Experimental notice**: the format may still change (a version field is included to keep old files readable); validation in single-user scenarios is limited.
 
 ## License
 

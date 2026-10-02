@@ -29,12 +29,14 @@ PDF 批注的 Sidecar（边车文件）是指批注数据不写进 PDF 本体，
 |---|---|---|
 | `Annotations.separateSave` | false | 打开 sidecar 功能 |
 | `Annotations.centralFolder` | 空 | 批注集中存放目录 |
+| `Annotations.separateSaveAsMd` | false | sidecar 存为 Markdown 而非 JSON（**实验性**，见下） |
 
 ```ini
 Annotations [
     ....
 	SeparateSave = true
 	CentralFolder = E:\Downloads\Claw
+    SeparateSaveAsMd = true
 ]
 ```
 
@@ -54,7 +56,38 @@ FreeText 支持字体、字号、文字颜色、对齐方式、加粗、斜体�
 - 大批注有防御性上限：多边形/折线 512 个顶点，墨迹 64 笔、每笔最多 2048 个点。超出的部分截断。
 - 别的阅读器打开这个 PDF 看不到批注——数据在 JSON 里，不在 PDF 里。这是设计使然。
 
+## Markdown sidecar（实验性 🧪）
 
+设置 `SeparateSaveAsMd = true` 后，批注存成 `book.md` 而不是 `book.json`：每条批注是一个 Obsidian callout，可用md编辑器编辑。
+
+```markdown
+---
+sumatrapdf_sidecar: 2
+generator: SumatraPDF-sidecar/2-md
+file: 教材.pdf
+---
+# 我的读书笔记（随便写，保存时逐字保留）
+
+> [!Note]
+> type: highlight
+> page: 11
+> rect: [58.4,695.2,299.6,708.4]
+> quads: [[58.4,708.4,299.6,695.2,58.4,695.2,299.6,708.4]]
+> text: highlighted words
+> contents: highlighted words
+> author: AlexShy
+```
+
+规则：
+
+- **callout 外的一切都是你的**。标题、散文、普通引用块——SumatraPDF 读写时逐字保留，只动 callout 里 `key: value` 形式的机器行。批注数据和批注笔记从此住同一个文件。
+- **contents 行恒存在**。没有批注文字时用高亮原文填充；两者都空时是 `contents: ""`，在 Obsidian 里手填，重开文档生效。
+- **双向同步，以重开为界**。关闭文档后删掉一个 callout，重开时该批注消失；手写一个合法 callout（不推荐，难以精确计算坐标），重开时变成真批注。文档开着时改 md，保存会被会话数据覆盖——外部编辑请关掉文档再动。
+- **自动迁移**。开启后读取优先 `.md`，没有则回退 `.json`；下一次保存写 `.md`，旧 `.json` 原样保留不再更新。
+- **原子写盘**。md 混着你的笔记，保存走临时文件 + 替换，中途崩溃不会毁文件。
+- **查询**：front matter 是 YAML 字段；callout 内 `key:: value` 双冒号兼容。
+
+⚠️ **实验性说明**：格式仍可能调整（带版本号字段，保证旧文件可读）；单人场景验证有限。
 
 ## 许可证
 
