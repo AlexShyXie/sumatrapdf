@@ -3226,11 +3226,15 @@ struct SidecarSyncEntry {
     int type = -1; // AnnotationType
     int pageNo = 0;
     RectF bounds;
+    Str sig; // serialized machine line (JSON): content signature, lets the
+             // reload classify external edits vs adds vs deletes
 };
 
 static void FreeSidecarSyncEntry(SidecarSyncEntry& e) {
     str::Free(e.name);
     e.name = {};
+    str::Free(e.sig);
+    e.sig = {};
 }
 
 // identity comparison, same matching rules as PageHasAnnot / MdMatchEntries:
@@ -3319,6 +3323,15 @@ static SidecarSyncEntry SidecarSyncEntryFromAnnot(Annotation* a) {
 // identities as they exist in the parsed sidecar file; entries with an
 // unreadable payload are excluded so their live counterparts are NOT
 // deleted (they cannot be replayed, deleting them would lose content)
+// content signature: the single-source machine line of an entry, same
+// serialization the sidecar writer uses - identity-matched entries with
+// different sigs were externally changed
+static Str SidecarSyncEntrySig(const SidecarAnnot& sa) {
+    str::Builder b;
+    SerializeAnnotJson(b, sa);
+    return b.TakeStr();
+}
+
 static Vec<SidecarSyncEntry> SidecarSyncEntriesFromParsed(const Vec<SidecarAnnot>& entries) {
     Vec<SidecarSyncEntry> res;
     for (const SidecarAnnot& sa : entries) {
@@ -3330,6 +3343,7 @@ static Vec<SidecarSyncEntry> SidecarSyncEntriesFromParsed(const Vec<SidecarAnnot
         e.type = (int)sa.type;
         e.pageNo = sa.pageNo;
         e.bounds = sa.bounds;
+        e.sig = SidecarSyncEntrySig(sa);
         VecAppend(res, std::move(e));
     }
     return res;
@@ -3359,9 +3373,45 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
     LoadSidecarAssetBuffers(ctx, tgt.path, entries);
     Vec<SidecarSyncEntry> mdIds = SidecarSyncEntriesFromParsed(entries);
 
+    // change classification: diff the new file content against the identity
+    // + signature set recorded at the last sync point. The clear+replay
+    // below rebuilds far more annotations than the external change actually
+    // touched, so deleted/imported counts are meaningless to the user
+    int nAdded = 0, nRemoved = 0, nUpdated = 0;
+    if (st) {
+        for (SidecarSyncEntry& m : mdIds) {
+            bool found = false;
+            for (SidecarSyncEntry& b : st->base) {
+                if (SidecarSyncEntryMatches(m, b)) {
+                    found = true;
+                    if (!str::Eq(m.sig, b.sig)) {
+                        nUpdated++;
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                nAdded++;
+            }
+        }
+        for (SidecarSyncEntry& b : st->base) {
+            bool found = false;
+            for (SidecarSyncEntry& m : mdIds) {
+                if (SidecarSyncEntryMatches(b, m)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                nRemoved++;
+            }
+        }
+    }
+
     Vec<Annotation*> annots;
     EngineMupdfGetAnnotations((EngineBase*)e, annots);
     Vec<Annotation*> toDelete;
+    int nKept = 0;
     for (Annotation* a : annots) {
         if (!a || !AnnotationIsLive(a)) {
             continue;
@@ -3387,6 +3437,8 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
         // local edits that were never written: keep them.
         if (mdHas || baseHas) {
             VecAppend(toDelete, a);
+        } else {
+            nKept++;
         }
         FreeSidecarSyncEntry(id);
     }
@@ -3414,12 +3466,29 @@ static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarT
     SidecarFileFingerprint(tgt.path, st->size, st->modTime);
 
     bool changed = nDeleted > 0 || nImported > 0;
+    int nTouched = nAdded + nRemoved + nUpdated;
     if (changed) {
+        // user-facing summary of what the external change did, counted from
+        // the content diff (not from the clear+replay rebuild); an
+        // equivalent content change (OneDrive touched mtime) stays silent
+        if (nTouched > 0) {
+            Str keptSuffix = nKept > 0 ? fmt(", %d local unsaved kept", nKept) : Str{};
+            auto what = nRemoved > 0 && nAdded == 0 && nUpdated == 0
+                            ? StrL("Removed")
+                            : (nAdded > 0 && nRemoved == 0 && nUpdated == 0 ? StrL("Loaded") : StrL("Reloaded"));
+            auto why = nRemoved > 0 && nAdded == 0 && nUpdated == 0 ? StrL("deleted externally")
+                                                                    : StrL("from external changes");
+            ShowPlainNotification(win->hwndCanvas,
+                                  fmt("%s %d annotation%s %s%s", what, nTouched,
+                                      nTouched == 1 ? StrL("") : StrL("s"), why, keptSuffix),
+                                  5000);
+        }
         RefreshAnnotationLists(tab);
         if (IsMainWindowValidAndNotClosing(win)) {
             MainWindowRerender(win);
         }
-        logf("sidecar: reloaded from '%s' (%d deleted, %d imported)\n", tgt.path, nDeleted, nImported);
+        logf("sidecar: reloaded from '%s' (%d added, %d removed, %d updated; %d deleted, %d imported, %d kept)\n",
+             tgt.path, nAdded, nRemoved, nUpdated, nDeleted, nImported, nKept);
     }
     return changed;
 }
@@ -3674,6 +3743,8 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
         if (SidecarFileFingerprint(tgt.path, szNow, ftNow) &&
             (!st || st->size != szNow || !FileTimeEq(st->modTime, ftNow))) {
             logf("sidecar: '%s' changed externally, reloading before save\n", tgt.path);
+            ShowPlainNotification(win->hwndCanvas, StrL("External changes detected before saving, reloading first"),
+                                  5000);
             SidecarReloadFromDisk(tab, e, tgt, st);
             // re-arm the save either way: on success the debounced save
             // writes back the merged session; on failure (file locked) it
@@ -3717,8 +3788,9 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
         }
     }
     if (!WriteSidecarFileAtomic(tgt.path, data)) {
-        ShowWarningNotification(win->hwndCanvas,
-                                fmt(Tr("Failed to save '%s': %s").s, tgt.path, StrL("cannot write file")), 5000);
+        ShowWarningNotification(
+            win->hwndCanvas, fmt(Tr("Failed to save '%s': %s").s, path::GetBaseNameTemp(tgt.path), StrL("cannot write file")),
+            5000);
         logf("sidecar: failed to write '%s'\n", tgt.path);
         str::Free(data);
         fz_context* ctx = e->Ctx();
@@ -3750,16 +3822,22 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
 
     e->modifiedAnnotations = false;
     ToolbarUpdateStateForWindow(win, true);
+    TempStr baseName = path::GetBaseNameTemp(tgt.path);
+    auto loc = tgt.central ? StrL("in central folder") : StrL("next to PDF");
     if (nSkippedUnsupported > 0) {
         // make it visible that some annotations (unsupported types or
         // unreadable payloads) are not in the sidecar and will be lost on
-        // reopen
-        ShowPlainNotification(win->hwndCanvas,
-                              fmt("Saved annotations to '%s' (%d skipped: unsupported or unreadable annotations)",
-                                  tgt.path, nSkippedUnsupported),
+        // reopen (details in the log)
+        ShowPlainNotification(win->hwndCanvas, fmt("Saved annotations %s: '%s' (%d skipped)", loc, baseName,
+                                                  nSkippedUnsupported),
                               5000);
     } else {
-        ShowPlainNotification(win->hwndCanvas, fmt(Tr("Saved annotations to '%s'").s, tgt.path), 5000);
+        ShowPlainNotification(win->hwndCanvas,
+                              fmt(Tr(tgt.central ? "Saved annotations in central folder: '%s'"
+                                                 : "Saved annotations next to PDF: '%s'")
+                                      .s,
+                                  baseName),
+                              5000);
     }
     logf("sidecar: saved %d annotations to '%s' (%s, %d skipped)\n", len(annots), tgt.path,
          tgt.central ? StrL("central") : StrL("sibling"), nSkippedUnsupported);
