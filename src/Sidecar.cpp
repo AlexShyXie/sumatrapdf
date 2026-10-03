@@ -105,12 +105,15 @@ extern "C" {
 #include "gui/UIModels.h"
 #include "Settings.h"
 #include "Annotation.h"
+#include "AnnotEditToolbar.h"
+#include "AnnotTextPopup.h"
 #include "DocController.h"
 #include "EngineBase.h"
 #include "EngineAll.h"
 #include "EngineMupdf.h"
 #include "DisplayModel.h"
 #include "Translations.h"
+#include "SumatraPDF.h"
 #include "MainWindow.h"
 #include "WindowTab.h"
 #include "Notifications.h"
@@ -3189,6 +3192,352 @@ static int ImportSidecarEntries(EngineMupdf* e, const Vec<SidecarAnnot>& entries
 // ---------------------------------------------------------------------------
 // public API
 
+// ---------------------------------------------------------------------------
+// external sidecar changes: fingerprint + poll-reload
+//
+// The sidecar is a two-way source of truth: we write it after annotation
+// changes AND other devices (OneDrive sync, another viewer) may modify it
+// while the document is open. Without watching, the next auto-save would
+// blindly overwrite those external edits.
+//
+// Model (no merge analysis, plain "external wins" overwrite - same
+// semantics as closing and reopening the document):
+//  - Every sync point (import, save, reload) records the file fingerprint
+//    (mtime + size) and a "base" identity set (name / type / page / bounds
+//    per annotation) that the file content corresponds to.
+//  - A 2s poll timer per window stats the file; fingerprint drift means an
+//    external change and triggers a full reload from disk ("clear +
+//    replay").
+//  - Clear step: an annotation matched by the parsed file content is
+//    deleted (replayed from it); an annotation only present in the base
+//    set was deleted externally (deleted too). An annotation in NEITHER
+//    set is a local edit that was never written to disk: it survives the
+//    reload and the next debounced save writes it into the sidecar.
+//  - The reload is skipped while the user is actively editing (annotation
+//    selected, text popup shown, or mouse button down); it is retried on
+//    the next tick, so edits always win locally and are then overwritten
+//    only after they had a chance to reach the file.
+//  - SaveTab re-checks the fingerprint right before writing (closing the
+//    2s poll window): if the file changed behind our back, the reload runs
+//    first and the debounced save follows.
+
+struct SidecarSyncEntry {
+    Str name;      // may be empty: program-drawn annotations have no /NM
+    int type = -1; // AnnotationType
+    int pageNo = 0;
+    RectF bounds;
+};
+
+static void FreeSidecarSyncEntry(SidecarSyncEntry& e) {
+    str::Free(e.name);
+    e.name = {};
+}
+
+// identity comparison, same matching rules as PageHasAnnot / MdMatchEntries:
+// exact /NM match first, then type + page + rect overlap
+static bool SidecarSyncEntryMatches(const SidecarSyncEntry& a, const SidecarSyncEntry& b) {
+    if (len(a.name) > 0 && len(b.name) > 0) {
+        return str::Eq(a.name, b.name);
+    }
+    return a.type == b.type && a.pageNo == b.pageNo && fabsf(a.bounds.x - b.bounds.x) < 1.0f &&
+           fabsf(a.bounds.y - b.bounds.y) < 1.0f &&
+           fabsf((a.bounds.x + a.bounds.dx) - (b.bounds.x + b.bounds.dx)) < 1.0f &&
+           fabsf((a.bounds.y + a.bounds.dy) - (b.bounds.y + b.bounds.dy)) < 1.0f;
+}
+
+struct SidecarSyncState {
+    Str path;
+    i64 size = -1;
+    FILETIME modTime{};
+    Vec<SidecarSyncEntry> base;
+};
+
+static Vec<SidecarSyncState> gSidecarSync; // few entries, linear scan
+
+static SidecarSyncState* FindSidecarSyncState(Str path) {
+    for (SidecarSyncState& st : gSidecarSync) {
+        if (str::Eq(st.path, path)) {
+            return &st;
+        }
+    }
+    return nullptr;
+}
+
+// note: the returned pointer is invalidated by a later GetSidecarSyncState
+// (vector growth); callers use it within a single function scope
+static SidecarSyncState* GetSidecarSyncState(Str path) {
+    SidecarSyncState* st = FindSidecarSyncState(path);
+    if (st) {
+        return st;
+    }
+    SidecarSyncState ns;
+    ns.path = str::Dup(path);
+    VecAppend(gSidecarSync, std::move(ns));
+    return &gSidecarSync[len(gSidecarSync) - 1];
+}
+
+static void SidecarSyncSetBase(SidecarSyncState* st, Vec<SidecarSyncEntry>&& newBase) {
+    for (SidecarSyncEntry& e : st->base) {
+        FreeSidecarSyncEntry(e);
+    }
+    st->base = std::move(newBase);
+}
+
+static bool SidecarFileFingerprint(Str path, i64& sizeOut, FILETIME& ftOut) {
+    i64 sz = file::GetSize(path);
+    if (sz < 0) {
+        return false;
+    }
+    sizeOut = sz;
+    ftOut = file::GetModificationTime(path);
+    return true;
+}
+
+// lightweight identity of a live annotation (no StextCache / asset work)
+static SidecarSyncEntry SidecarSyncEntryFromAnnot(Annotation* a) {
+    SidecarSyncEntry e;
+    e.type = (int)a->type;
+    e.pageNo = PageNo(a);
+    e.bounds = GetBounds(a);
+    EngineMupdf* eng = a->engine;
+    if (eng && a->pdfannot) {
+        AutoUnlockRecursiveMutex cs(&eng->docLock);
+        fz_context* ctx = eng->Ctx();
+        fz_try(ctx) {
+            const char* nm = pdf_annot_name(ctx, a->pdfannot);
+            if (nm && *nm) {
+                e.name = str::Dup(Str(nm));
+            }
+        }
+        fz_catch(ctx) {
+            fz_report_error(ctx);
+        }
+    }
+    return e;
+}
+
+// identities as they exist in the parsed sidecar file; entries with an
+// unreadable payload are excluded so their live counterparts are NOT
+// deleted (they cannot be replayed, deleting them would lose content)
+static Vec<SidecarSyncEntry> SidecarSyncEntriesFromParsed(const Vec<SidecarAnnot>& entries) {
+    Vec<SidecarSyncEntry> res;
+    for (const SidecarAnnot& sa : entries) {
+        if (!sa.assetOk) {
+            continue;
+        }
+        SidecarSyncEntry e;
+        e.name = len(sa.name) > 0 ? str::Dup(sa.name) : Str{};
+        e.type = (int)sa.type;
+        e.pageNo = sa.pageNo;
+        e.bounds = sa.bounds;
+        VecAppend(res, std::move(e));
+    }
+    return res;
+}
+
+// full reload from disk: delete what the file owns (replayed from it) or
+// what was externally deleted (in base, absent from file); keep local edits
+// that were never synced. Returns true if the session changed.
+static bool SidecarReloadFromDisk(WindowTab* tab, EngineMupdf* e, const SidecarTarget& tgt, SidecarSyncState* st) {
+    MainWindow* win = tab->win;
+    Str data = file::ReadFile(tgt.path);
+    if (len(data) == 0) {
+        // read failure (e.g. OneDrive holding the file): retry on the next
+        // tick; the fingerprint is left untouched so we come back
+        return false;
+    }
+    fz_context* ctx = e->Ctx();
+    char* z = CStrTemp(data);
+    Vec<SidecarAnnot> entries;
+    bool parseOk =
+        str::EndsWithI(tgt.path, StrL(".md")) ? ParseSidecarMd(ctx, z, entries) : ParseSidecarJson(ctx, z, entries);
+    str::Free(data);
+    if (!parseOk) {
+        // half-written file or format change: retry on the next tick
+        return false;
+    }
+    LoadSidecarAssetBuffers(ctx, tgt.path, entries);
+    Vec<SidecarSyncEntry> mdIds = SidecarSyncEntriesFromParsed(entries);
+
+    Vec<Annotation*> annots;
+    EngineMupdfGetAnnotations((EngineBase*)e, annots);
+    Vec<Annotation*> toDelete;
+    for (Annotation* a : annots) {
+        if (!a || !AnnotationIsLive(a)) {
+            continue;
+        }
+        SidecarSyncEntry id = SidecarSyncEntryFromAnnot(a);
+        bool mdHas = false, baseHas = false;
+        for (SidecarSyncEntry& m : mdIds) {
+            if (SidecarSyncEntryMatches(id, m)) {
+                mdHas = true;
+                break;
+            }
+        }
+        if (!mdHas && st) {
+            for (SidecarSyncEntry& b : st->base) {
+                if (SidecarSyncEntryMatches(id, b)) {
+                    baseHas = true;
+                    break;
+                }
+            }
+        }
+        // file owns it (replay from file) or external delete (in base, gone
+        // from file): both are cleared. Annotations in neither set are
+        // local edits that were never written: keep them.
+        if (mdHas || baseHas) {
+            VecAppend(toDelete, a);
+        }
+        FreeSidecarSyncEntry(id);
+    }
+
+    // suppress the auto-save arming that MarkNotificationAsModified would
+    // do for the deletions and the replayed imports
+    gSidecarImporting = true;
+    int nDeleted = 0;
+    for (Annotation* a : toDelete) {
+        DetachAnnotationFromUI(a);
+        DeleteAnnotation(a);
+        nDeleted++;
+    }
+    int nImported = ImportSidecarEntries(e, entries);
+    gSidecarImporting = false;
+    for (SidecarAnnot& sa : entries) {
+        FreeSidecarAnnotStrings(ctx, sa);
+    }
+
+    // record the new sync point: base = file content, fingerprint = file now
+    if (!st) {
+        st = GetSidecarSyncState(tgt.path);
+    }
+    SidecarSyncSetBase(st, std::move(mdIds));
+    SidecarFileFingerprint(tgt.path, st->size, st->modTime);
+
+    bool changed = nDeleted > 0 || nImported > 0;
+    if (changed) {
+        RefreshAnnotationLists(tab);
+        if (IsMainWindowValidAndNotClosing(win)) {
+            MainWindowRerender(win);
+        }
+        logf("sidecar: reloaded from '%s' (%d deleted, %d imported)\n", tgt.path, nDeleted, nImported);
+    }
+    return changed;
+}
+
+static void CALLBACK SidecarPollTimerProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time);
+
+static constexpr UINT_PTR kSidecarPollTimerId = 0x513D;
+static constexpr UINT kSidecarPollDelayMs = 2000; // 2s poll
+
+static void SidecarEnsurePollTimer(MainWindow* win) {
+    if (!SidecarSeparateSaveEnabled()) {
+        return;
+    }
+    if (!win || !win->hwndFrame) {
+        return;
+    }
+    // periodic timer: fires every 2s until killed with the window
+    SetTimer(win->hwndFrame, kSidecarPollTimerId, kSidecarPollDelayMs, SidecarPollTimerProc);
+}
+
+static void SidecarPollTab(WindowTab* tab) {
+    if (!SidecarSeparateSaveEnabled()) {
+        return;
+    }
+    DisplayModel* dm = tab->AsFixed();
+    if (!dm) {
+        return;
+    }
+    EngineBase* engine = dm->GetEngine();
+    if (!engine || engine->kind != kindEngineMupdf) {
+        return;
+    }
+    EngineMupdf* e = AsEngineMupdf(engine);
+    if (!e || !e->pdfdoc) {
+        return;
+    }
+    // active editing: skip this tick, retry in 2s
+    if (tab->selectedAnnotation) {
+        return;
+    }
+    if (IsAnnotationTextPopupShown(tab->win)) {
+        return;
+    }
+    if (GetKeyState(VK_LBUTTON) & 0x8000) {
+        return;
+    }
+
+    Str pdfPath = engine->FilePath();
+    if (len(pdfPath) == 0) {
+        return; // memory / embedded documents have no sidecar
+    }
+    SidecarTarget tgt = ResolveSidecarTarget(pdfPath, /*allowCreate=*/false);
+    if (len(tgt.path) == 0 || !tgt.exists) {
+        // absent (never created) or gone (deleted / not yet synced in):
+        // hands off, we must not resurrect or preempt the file
+        return;
+    }
+    i64 sz = 0;
+    FILETIME ft{};
+    if (!SidecarFileFingerprint(tgt.path, sz, ft)) {
+        return;
+    }
+    SidecarSyncState* st = FindSidecarSyncState(tgt.path);
+    if (!st) {
+        // no sync point yet (file adopted externally / pre-existing): adopt
+        // the current fingerprint, the next change reloads
+        st = GetSidecarSyncState(tgt.path);
+        st->size = sz;
+        st->modTime = ft;
+        return;
+    }
+    if (st->size == sz && FileTimeEq(st->modTime, ft)) {
+        return;
+    }
+
+    if (SidecarReloadFromDisk(tab, e, tgt, st)) {
+        // write back local edits that survived the reload (debounced)
+        SidecarNotifyChanged((EngineBase*)e);
+    }
+}
+
+static void CALLBACK SidecarPollTimerProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time) {
+    (void)msg;
+    (void)id;
+    (void)time;
+    for (MainWindow* w : gWindows) {
+        if (w->hwndFrame == hwnd) {
+            Vec<WindowTab*> tabs = w->Tabs();
+            for (WindowTab* t : tabs) {
+                SidecarPollTab(t);
+            }
+            return;
+        }
+    }
+}
+
+// record the sync point after a successful import: base = parsed content,
+// fingerprint = file now. call after the entries were consumed but while
+// their strings are still alive
+static MainWindow* FindWindowForEngine(EngineBase* engine); // defined below
+
+static void SidecarRecordImportedSync(EngineBase* engine, const SidecarTarget& use, const Vec<SidecarAnnot>& entries) {
+    MainWindow* win = FindWindowForEngine(engine);
+    SidecarSyncState* st = GetSidecarSyncState(use.path);
+    SidecarSyncSetBase(st, SidecarSyncEntriesFromParsed(entries));
+    SidecarFileFingerprint(use.path, st->size, st->modTime);
+    SidecarEnsurePollTimer(win);
+}
+
+// record the sync point after a successful save: base = what we wrote
+// (entries are still alive here), fingerprint = file now
+static void SidecarRecordSavedSync(EngineBase* engine, const SidecarTarget& tgt, const Vec<SidecarAnnot>& entries) {
+    SidecarSyncState* st = GetSidecarSyncState(tgt.path);
+    SidecarSyncSetBase(st, SidecarSyncEntriesFromParsed(entries));
+    SidecarFileFingerprint(tgt.path, st->size, st->modTime);
+    SidecarEnsurePollTimer(FindWindowForEngine(engine));
+}
+
 // lazily route the engine-side annotation-changed notification to us: the
 // hook lives in EngineMupdf.cpp (compiled into every target) and must be
 // installed by the one target that links Sidecar.cpp (the application). Any
@@ -3256,6 +3605,9 @@ void SidecarMaybeImport(EngineBase* engine) {
     }
     str::Free(data); // entry strings were dup'ed out of the JSON DOM
     if (len(entries) == 0) {
+        // still a valid sync point (empty file): record it so the poller
+        // does not adopt a stale fingerprint later
+        SidecarRecordImportedSync(engine, use, entries);
         logf("sidecar: no supported annotations in '%s'\n", use.path);
         return;
     }
@@ -3267,6 +3619,7 @@ void SidecarMaybeImport(EngineBase* engine) {
     gSidecarImporting = true;
     int n = ImportSidecarEntries(e, entries);
     gSidecarImporting = false;
+    SidecarRecordImportedSync(engine, use, entries);
     for (SidecarAnnot& sa : entries) {
         FreeSidecarAnnotStrings(ctx, sa);
     }
@@ -3308,6 +3661,27 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
     }
     if (!EngineHasUnsavedAnnotations(engine)) {
         return SidecarResult::Saved;
+    }
+
+    // never blind-overwrite an externally modified file: if the fingerprint
+    // drifted since our last sync point (the 2s poller was skipped due to
+    // active editing, or the change landed within the poll window), reload
+    // first; the debounced save then re-runs against the merged session
+    if (tgt.exists) {
+        i64 szNow = 0;
+        FILETIME ftNow{};
+        SidecarSyncState* st = FindSidecarSyncState(tgt.path);
+        if (SidecarFileFingerprint(tgt.path, szNow, ftNow) &&
+            (!st || st->size != szNow || !FileTimeEq(st->modTime, ftNow))) {
+            logf("sidecar: '%s' changed externally, reloading before save\n", tgt.path);
+            SidecarReloadFromDisk(tab, e, tgt, st);
+            // re-arm the save either way: on success the debounced save
+            // writes back the merged session; on failure (file locked) it
+            // retries through here until the file becomes writable
+            SidecarNotifyChanged(engine);
+            // caller sees success; the real write follows via the debounce
+            return SidecarResult::Saved;
+        }
     }
 
     Vec<Annotation*> annots;
@@ -3361,6 +3735,7 @@ SidecarResult SidecarSaveTab(WindowTab* tab, bool allowCreate) {
     {
         fz_context* ctx = e->Ctx();
         int nAssetFailed = WriteSidecarAssets(tgt.path, entries);
+        SidecarRecordSavedSync(engine, tgt, entries);
         for (SidecarAnnot& sa : entries) {
             FreeSidecarAnnotStrings(ctx, sa);
         }
@@ -3461,5 +3836,6 @@ void SidecarNotifyChanged(EngineBase* engine) {
         engine->AddRef();
         gSidecarAutoSaveEngine = engine;
     }
+    SidecarEnsurePollTimer(win); // belt-and-braces: the poll timer should already run
     SetTimer(win->hwndFrame, kSidecarTimerId, kSidecarAutoSaveDelayMs, SidecarAutoSaveTimerProc);
 }
